@@ -27,7 +27,11 @@ jobs:
     - name: Build Debug APK
       run: ./gradlew assembleDebug
 
-    - name: Upload Finished APK to Web
-      run: |
-        APK_PATH=$(find app/build/outputs/apk/debug/ -name "*.apk" | head -n 1)
-        curl -F reqtype=fileupload -F "fileToUpload=@$APK_PATH" https://catbox.moe/user/api.php
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v1.0.0
+        name: Ludo Game Build
+        files: app/build/outputs/apk/debug/*.apk
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
