@@ -17,8 +17,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.shadow
@@ -65,7 +68,10 @@ data class GameState(
     val diceValue: Int = 1,
     val hasRolled: Boolean = false,
     val message: String = "Red's turn. Roll the dice!",
-    val winOrder: List<Int> = emptyList()
+    val winOrder: List<Int> = emptyList(),
+    val lastKillTimestamp: Long = 0L,
+    val killEventTimestamp: Long = 0L,
+    val lastKillPos: Int = -1
 )
 
 // Board maps
@@ -140,8 +146,18 @@ class GameEngine {
                 message = "${playerName(state.currentPlayer)} rolled $roll. No valid moves."
             )
             onDelay {
-                delay(1000)
+                kotlinx.coroutines.delay(1000)
                 nextPlayer()
+            }
+        } else if (validMoves.size == 1) {
+            state = state.copy(
+                diceValue = roll,
+                hasRolled = true,
+                message = "${playerName(state.currentPlayer)} rolled $roll. Auto-moving token."
+            )
+            onDelay {
+                kotlinx.coroutines.delay(800)
+                moveToken(validMoves[0].id, validMoves[0].player, onDelay)
             }
         } else {
             state = state.copy(
@@ -164,63 +180,104 @@ class GameEngine {
         return true
     }
 
-    fun moveToken(tokenId: Int, playerIndex: Int) {
+    fun moveToken(tokenId: Int, playerIndex: Int, launch: (suspend () -> Unit) -> Unit) {
         if (!state.hasRolled || state.currentPlayer != playerIndex || state.winOrder.size >= 3) return
         
         val token = state.tokens.find { it.id == tokenId && it.player == playerIndex } ?: return
         if (!isValidMove(token, state.diceValue)) return
 
-        val newTokens = state.tokens.toMutableList()
-        val index = newTokens.indexOf(token)
+        val originalSteps = token.steps
+        val diceVal = state.diceValue
         
-        var newSteps = token.steps
-        if (newSteps == -1) {
-            newSteps = 0
+        val pathSteps = mutableListOf<Int>()
+        if (originalSteps == -1) {
+            pathSteps.add(0)
         } else {
-            newSteps += state.diceValue
-        }
-        
-        newTokens[index] = token.copy(steps = newSteps)
-
-        var killedOpponent = false
-        if (newSteps in 0..50) {
-            val globalPos = (playerIndex * 13 + newSteps) % 52
-            if (!safeCells.contains(globalPos)) {
-                val opponentsHere = newTokens.filter {
-                    it.player != playerIndex &&
-                    it.steps in 0..50 &&
-                    ((it.player * 13 + it.steps) % 52) == globalPos
-                }
-                opponentsHere.forEach { opp ->
-                     val oppIndex = newTokens.indexOf(opp)
-                     newTokens[oppIndex] = opp.copy(steps = -1)
-                     killedOpponent = true
-                }
+            for (i in 1..diceVal) {
+                pathSteps.add(originalSteps + i)
             }
         }
+        
+        val finalSteps = if (originalSteps == -1) 0 else originalSteps + diceVal
 
-        val hasExtraTurn = state.diceValue == 6 || killedOpponent || newSteps == 56
+        launch {
+            val movedTokens = state.tokens.toMutableList()
+            val index = movedTokens.indexOfFirst { it.id == tokenId && it.player == playerIndex }
+            movedTokens[index] = movedTokens[index].copy(steps = finalSteps)
 
-        val winOrder = state.winOrder.toMutableList()
-        val isPlayerFinished = newTokens.filter { it.player == playerIndex }.all { it.steps == 56 }
-        if (isPlayerFinished && !winOrder.contains(playerIndex)) {
-            winOrder.add(playerIndex)
-        }
+            var killedOpponent = false
+            var killGlobalPos = -1
+            val opponentsToKill = mutableListOf<TokenState>()
+            
+            if (finalSteps in 0..50) {
+                val globalPos = (playerIndex * 13 + finalSteps) % 52
+                if (!safeCells.contains(globalPos)) {
+                    val opponentsHere = movedTokens.filter {
+                        it.player != playerIndex &&
+                        it.steps in 0..50 &&
+                        ((it.player * 13 + it.steps) % 52) == globalPos
+                    }
+                    if (opponentsHere.isNotEmpty()) {
+                        opponentsToKill.addAll(opponentsHere)
+                        killedOpponent = true
+                        killGlobalPos = globalPos
+                    }
+                }
+            }
 
-        state = state.copy(tokens = newTokens, winOrder = winOrder)
+            if (killedOpponent) {
+                // 1. Move attacker
+                state = state.copy(tokens = movedTokens)
+                
+                // 2. Wait for attacker to arrive at the cell
+                kotlinx.coroutines.delay(400)
+                
+                // 3. Trigger zoom
+                state = state.copy(
+                    lastKillTimestamp = System.currentTimeMillis(),
+                    lastKillPos = killGlobalPos
+                )
+                
+                // 4. Wait for zoom peak (cinematic scale takes its time)
+                kotlinx.coroutines.delay(800)
+                
+                // 5. Remove victims and trigger ring
+                val killedTokens = state.tokens.toMutableList()
+                opponentsToKill.forEach { opp ->
+                    val oppIndex = killedTokens.indexOfFirst { it.id == opp.id && it.player == opp.player }
+                    if (oppIndex != -1) {
+                         killedTokens[oppIndex] = killedTokens[oppIndex].copy(steps = -1)
+                    }
+                }
+                state = state.copy(tokens = killedTokens, killEventTimestamp = System.currentTimeMillis())
+                
+                // 6. Wait to show the effect before zoom out begins
+                kotlinx.coroutines.delay(600)
+            } else {
+                state = state.copy(tokens = movedTokens)
+            }
 
-        if (winOrder.size >= 3) {
-            state = state.copy(message = "Game Over! Winner: ${playerName(winOrder[0])}", hasRolled = true)
-            return
-        }
+            val hasExtraTurn = state.diceValue == 6 || killedOpponent || finalSteps == 56
 
-        if (hasExtraTurn && !isPlayerFinished) {
-             state = state.copy(
-                 hasRolled = false,
-                 message = "Extra turn! Roll again."
-             )
-        } else {
-             nextPlayer()
+            val winOrder = state.winOrder.toMutableList()
+            val finalTokens = state.tokens
+            val isPlayerFinished = finalTokens.filter { it.player == playerIndex }.all { it.steps == 56 }
+            if (isPlayerFinished && !winOrder.contains(playerIndex)) {
+                winOrder.add(playerIndex)
+            }
+
+            state = state.copy(winOrder = winOrder)
+
+            if (winOrder.size >= 3) {
+                state = state.copy(message = "Game Over! Winner: ${playerName(winOrder[0])}", hasRolled = true)
+            } else if (hasExtraTurn && !isPlayerFinished) {
+                 state = state.copy(
+                     hasRolled = false,
+                     message = "Extra turn! Roll again."
+                 )
+            } else {
+                 nextPlayer()
+            }
         }
     }
 
@@ -297,7 +354,7 @@ fun PlayerPanel(
     isActive: Boolean,
     diceValue: Int,
     isRolling: Boolean,
-    onRoll: (Offset) -> Unit
+    onRoll: (Offset, Int?) -> Unit
 ) {
     val color = getPlayerColor(playerIdx)
     val alpha by animateFloatAsState(if (isActive) 1f else 0.4f)
@@ -331,7 +388,7 @@ fun PlayerPanel(
             Box(
                 modifier = Modifier
                     .size(45.dp)
-                    .clickable { onRoll(Offset(0f, -10f)) }
+                    .clickable { onRoll(Offset(0f, -10f), null) }
                     .graphicsLayer { shadowElevation = 8f; shape = RoundedCornerShape(12.dp) }
                     .background(color, RoundedCornerShape(12.dp))
                     .border(2.dp, Color.White, RoundedCornerShape(12.dp)),
@@ -361,15 +418,17 @@ fun LudoApp(modifier: Modifier = Modifier) {
     val diceScale = remember { Animatable(1f) }
     
     var isRolling by remember { mutableStateOf(false) }
+    var showGoldenPulse by remember { mutableStateOf(false) }
     var currentDiceValue by remember { mutableStateOf(1) }
 
-    val triggerRoll: (Offset) -> Unit = { dir ->
+    val triggerRoll: (Offset, Int?) -> Unit = { dir, forcedValue ->
         if (!isRolling && !engine.state.hasRolled && engine.state.winOrder.size < 3) {
-            val rollResult = Random.nextInt(1, 7)
+            val rollResult = forcedValue ?: Random.nextInt(1, 7)
             val pColor = getPlayerColor(engine.state.currentPlayer)
             
             diceColor = pColor
             isRolling = true
+            showGoldenPulse = false
             diceValue = rollResult
             diceVisible = true
 
@@ -392,9 +451,19 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 val endX = (Random.nextFloat() - 0.5f) * 200f
                 val endY = (Random.nextFloat() - 0.5f) * 200f
                 
-                val rotX = 360f * 4f
-                val rotY = 360f * 3f
-                val rotZ = 360f * 2f + (Random.nextFloat() * 60f - 30f)
+                val targetRots = when(rollResult) {
+                    1 -> Triple(0f, 0f, 0f)
+                    2 -> Triple(0f, -90f, 0f)
+                    5 -> Triple(0f, 90f, 0f)
+                    3 -> Triple(90f, 0f, 0f)
+                    4 -> Triple(-90f, 0f, 0f)
+                    6 -> Triple(180f, 0f, 0f)
+                    else -> Triple(0f, 0f, 0f)
+                }
+
+                val rotX = 360f * 4f + targetRots.first
+                val rotY = 360f * 3f + targetRots.second
+                val rotZ = 360f * 2f + targetRots.third + (Random.nextFloat() * 60f - 30f)
 
                 launch { diceOffsetX.animateTo(endX, animationSpec = spring(dampingRatio = 0.55f, stiffness = 60f)) }
                 launch { diceOffsetY.animateTo(endY, animationSpec = spring(dampingRatio = 0.55f, stiffness = 60f)) }
@@ -415,9 +484,14 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 isRolling = false
                 currentDiceValue = rollResult
                 
+                // Show golden pulse for 0.7 seconds
+                showGoldenPulse = true
+                delay(700)
+                showGoldenPulse = false
+                
                 engine.processRoll(rollResult) { action -> scope.launch { action() } }
                 
-                delay(1500)
+                delay(600)
                 diceVisible = false
             }
         }
@@ -437,7 +511,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     onDragEnd = {
                         val dir = Offset(dragEnd.x - dragStart.x, dragEnd.y - dragStart.y)
                         val effDir = if (sqrt(dir.x * dir.x + dir.y * dir.y) < 20f) Offset(0f, 100f) else dir
-                        triggerRoll(effDir)
+                        triggerRoll(effDir, null)
                     }
                 )
             }
@@ -457,13 +531,60 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 }
             }
 
+            // Cinematic Zoom Animation
+            var cinematicScale by remember { mutableStateOf(1f) }
+            val animCinematicScale by animateFloatAsState(targetValue = cinematicScale, animationSpec = spring(dampingRatio = 0.5f, stiffness = 100f))
+            
+            LaunchedEffect(engine.state.lastKillTimestamp) {
+                if (engine.state.lastKillTimestamp > 0) {
+                    cinematicScale = 1.45f
+                    delay(1500)
+                    cinematicScale = 1f
+                }
+            }
+
             // The Board
+            val killRingScale = remember { Animatable(0f) }
+            val killRingAlpha = remember { Animatable(0f) }
+            LaunchedEffect(engine.state.killEventTimestamp) {
+                if (engine.state.killEventTimestamp > 0) {
+                    killRingAlpha.snapTo(1f)
+                    killRingScale.snapTo(0f)
+                    launch { killRingScale.animateTo(1f, tween(800, easing = LinearOutSlowInEasing)) }
+                    launch { killRingAlpha.animateTo(0f, tween(800)) }
+                }
+            }
+
             BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth(0.95f)
                     .aspectRatio(1f)
+                    .graphicsLayer {
+                        scaleX = animCinematicScale
+                        scaleY = animCinematicScale
+                        if (engine.state.lastKillPos >= 0 && engine.state.lastKillPos < globalPath.size) {
+                             val cell = globalPath[engine.state.lastKillPos]
+                             val pivotX = (cell.second + 0.5f) / 15f
+                             val pivotY = (cell.first + 0.5f) / 15f
+                             transformOrigin = androidx.compose.ui.graphics.TransformOrigin(pivotX, pivotY)
+                        }
+                    }
                     .background(Color.White)
                     .border(2.dp, Color.Black)
+                    .drawWithContent {
+                        drawContent()
+                        if (killRingAlpha.value > 0f && engine.state.lastKillPos >= 0) {
+                              val cell = globalPath[engine.state.lastKillPos]
+                              val cx = (cell.second + 0.5f) * (this.size.width / 15f)
+                              val cy = (cell.first + 0.5f) * (this.size.height / 15f)
+                              drawCircle(
+                                  color = Color.Red.copy(alpha = killRingAlpha.value),
+                                  radius = (this.size.width / 30f) + (this.size.width / 5f) * killRingScale.value,
+                                  center = Offset(cx, cy),
+                                  style = androidx.compose.ui.graphics.drawscope.Stroke(width = 12f)
+                              )
+                        }
+                    }
             ) {
                 val cellPx = maxWidth / 15
                 
@@ -584,8 +705,10 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     val targetX = cellPx * pos.second - tokenRadius + shiftX
                     val targetY = cellPx * pos.first - tokenRadius + shiftY
                     
-                    val animX by animateDpAsState(targetValue = targetX, animationSpec = spring(dampingRatio = 0.6f, stiffness = 300f))
-                    val animY by animateDpAsState(targetValue = targetY, animationSpec = spring(dampingRatio = 0.6f, stiffness = 300f))
+                    
+                    val animX by animateDpAsState(targetValue = targetX, animationSpec = spring(dampingRatio = 0.6f, stiffness = 60f))
+                    val animY by animateDpAsState(targetValue = targetY, animationSpec = spring(dampingRatio = 0.6f, stiffness = 60f))
+                    
                     
                     val isMyTurnToken = engine.state.currentPlayer == token.player && engine.state.hasRolled && !isRolling && engine.isValidMove(token, currentDiceValue)
                     
@@ -594,20 +717,78 @@ fun LudoApp(modifier: Modifier = Modifier) {
                          animationSpec = spring()
                     )
 
+                    val winPulseScale = remember { Animatable(1f) }
+                    val winPulseAlpha = remember { Animatable(0f) }
+                    LaunchedEffect(token.steps) {
+                        if (token.steps == 56) {
+                            winPulseScale.snapTo(1f)
+                            winPulseAlpha.snapTo(1f)
+                            launch { winPulseScale.animateTo(3f, tween(1200, easing = LinearOutSlowInEasing)) }
+                            launch { winPulseAlpha.animateTo(0f, tween(1200)) }
+                        }
+                    }
+
                     Box(modifier = Modifier
                         .offset(x = animX, y = animY)
                         .size(tokenRadius * 2)
                         .zIndex(if (isOnPath) idxInGroup.toFloat() else 0f)
-                        .graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
-                            shadowElevation = if (animX != targetX || animY != targetY || isMyTurnToken) 24f else 8f
-                            shape = CircleShape
+                        .drawBehind {
+                            if (animX != targetX || animY != targetY) {
+                                val dx = animX.toPx() - targetX.toPx()
+                                val dy = animY.toPx() - targetY.toPx()
+                                val dist = kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+                                if (dist > 5f) {
+                                    val tailLength = minOf(dist * 2.5f + size.width, 300f) 
+                                    val nx = dx / dist
+                                    val ny = dy / dist
+                                    
+                                    val currentSize = this.size.width
+                                    val endTail = Offset(
+                                        currentSize / 2f + nx * tailLength,
+                                        currentSize / 2f + ny * tailLength
+                                    )
+                                    val centerOff = Offset(currentSize / 2f, currentSize / 2f)
+                                    
+                                    drawLine(
+                                        color = Color(0xFF00E5FF),
+                                        start = centerOff,
+                                        end = endTail,
+                                        strokeWidth = 24f,
+                                        cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                                        alpha = 0.85f
+                                    )
+                                }
+                            }
+                            if (winPulseAlpha.value > 0f) {
+                                drawCircle(
+                                    color = Color(0xFFFFD700).copy(alpha = winPulseAlpha.value),
+                                    radius = size.width / 2f * winPulseScale.value,
+                                    center = Offset(size.width / 2f, size.height / 2f),
+                                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 8f)
+                                )
+                                drawCircle(
+                                    color = Color.White.copy(alpha = winPulseAlpha.value * 0.5f),
+                                    radius = size.width / 2f * (winPulseScale.value * 1.3f),
+                                    center = Offset(size.width / 2f, size.height / 2f),
+                                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f)
+                                )
+                            }
                         }
-                        .background(getPlayerColor(token.player), CircleShape)
-                        .border(1.dp, Color.Black.copy(alpha = 0.6f), CircleShape)
-                        .clickable { engine.moveToken(token.id, token.player) }
                     ) {
+                        Box(modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                scaleX = scale
+                                scaleY = scale
+                                shadowElevation = if (animX != targetX || animY != targetY || isMyTurnToken) 24f else 8f
+                                shape = CircleShape
+                            }
+                            .background(getPlayerColor(token.player), CircleShape)
+                            .border(1.dp, Color.Black.copy(alpha = 0.6f), CircleShape)
+                            .clickable { 
+                                engine.moveToken(token.id, token.player) { action -> scope.launch { action() } } 
+                            }
+                        ) {
                         if (isMyTurnToken) {
                             // Golden spinning ring
                             Box(modifier = Modifier
@@ -654,6 +835,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                 shape = RoundedCornerShape(50)
                             )
                         )
+                        } // End inner Box
                     }
                 }
             }
@@ -672,6 +854,9 @@ fun LudoApp(modifier: Modifier = Modifier) {
                modifier = Modifier.padding(bottom = 24.dp),
                horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                var devClickCount by remember { mutableStateOf(0) }
+                var showDevOptions by remember { mutableStateOf(false) }
+
                 Text(
                     text = engine.state.message,
                     fontSize = 18.sp,
@@ -682,7 +867,16 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     text = "Swipe anywhere or Tap active dice to roll",
                     color = Color.Gray,
                     fontSize = 12.sp,
-                    modifier = Modifier.padding(top = 4.dp)
+                    modifier = Modifier.padding(top = 4.dp).clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        devClickCount++
+                        if (devClickCount >= 7) {
+                            showDevOptions = !showDevOptions
+                            devClickCount = 0
+                        }
+                    }
                 )
                 if(engine.state.winOrder.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(8.dp))
@@ -691,48 +885,79 @@ fun LudoApp(modifier: Modifier = Modifier) {
                         fontWeight = FontWeight.Bold
                     )
                 }
+                
+                if (showDevOptions) {
+                    Row(modifier = Modifier.padding(top = 16.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        (1..6).forEach { forceVal ->
+                            androidx.compose.material3.Button(
+                                onClick = { 
+                                    triggerRoll(Offset(0f, -10f), forceVal)
+                                },
+                                modifier = Modifier.size(40.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+                            ) { Text(forceVal.toString()) }
+                        }
+                    }
+                }
             }
         }
 
         // Flying Dice Overlay
         if (diceVisible) {
-            var visualValue by remember { mutableStateOf(diceValue) }
-            LaunchedEffect(isRolling) {
-                if (isRolling) {
-                    while (isRolling) {
-                        visualValue = Random.nextInt(1, 7)
-                        delay(40)
-                    }
-                } else {
-                    visualValue = diceValue
+            val commonModifier = Modifier
+                .align(Alignment.Center)
+                .offset(x = diceOffsetX.value.dp, y = diceOffsetY.value.dp)
+                .size(90.dp)
+                .graphicsLayer {
+                    scaleX = diceScale.value
+                    scaleY = diceScale.value
+                    rotationZ = diceRotationZ.value
+                    shadowElevation = if (isRolling) 32f else 16f
+                    shape = RoundedCornerShape(16.dp)
                 }
-            }
-            
-            Box(
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .offset(x = diceOffsetX.value.dp, y = diceOffsetY.value.dp)
-                    .graphicsLayer {
-                        cameraDistance = 12f * density
-                        rotationX = diceRotationX.value
-                        rotationY = diceRotationY.value
-                        rotationZ = diceRotationZ.value
-                        scaleX = diceScale.value
-                        scaleY = diceScale.value
-                        shadowElevation = if (isRolling) 32f else 16f
-                        shape = RoundedCornerShape(16.dp)
-                    }
-                    .size(65.dp)
-                    .background(diceColor, RoundedCornerShape(16.dp))
-                    .background(
-                        Brush.verticalGradient(
-                            listOf(Color.White.copy(alpha=0.3f), Color.Transparent)
-                        ), RoundedCornerShape(16.dp)
+
+            Box(modifier = commonModifier, contentAlignment = Alignment.Center) {
+                if (showGoldenPulse) {
+                    val infiniteTransition = rememberInfiniteTransition()
+                    val pulseScale by infiniteTransition.animateFloat(
+                        initialValue = 1f,
+                        targetValue = 1.3f,
+                        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse)
                     )
-                    .border(2.dp, Color.White, RoundedCornerShape(16.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                DiceDots(if (isRolling) visualValue else diceValue)
+                    val pulseAlpha by infiniteTransition.animateFloat(
+                        initialValue = 1f,
+                        targetValue = 0f,
+                        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Restart)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .scale(pulseScale)
+                            .border(4.dp, Color(0xFFFFD700).copy(alpha = pulseAlpha), RoundedCornerShape(16.dp))
+                    )
+                }
+
+                var visualValue by remember { mutableStateOf(diceValue) }
+                LaunchedEffect(isRolling) {
+                    if (isRolling) {
+                        while (isRolling) {
+                            visualValue = Random.nextInt(1, 7)
+                            delay(40)
+                        }
+                    } else {
+                        visualValue = diceValue
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(diceColor, RoundedCornerShape(16.dp))
+                        .border(3.dp, Color.White, RoundedCornerShape(16.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    DiceDots(if (isRolling) visualValue else diceValue)
+                }
             }
         }
     }
