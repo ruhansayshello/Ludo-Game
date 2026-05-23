@@ -30,4 +30,4 @@ jobs:
     - name: Upload Finished APK to Web
       run: |
         APK_PATH=$(find app/build/outputs/apk/debug/ -name "*.apk" | head -n 1)
-        curl -F "file=@$APK_PATH" https://catbox.moe/user/api.php
+        curl -F reqtype=fileupload -F "fileToUpload=@$APK_PATH" https://catbox.moe/user/api.php
