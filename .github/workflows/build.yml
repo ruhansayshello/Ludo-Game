@@ -1,0 +1,29 @@
+name: Android APK Compiler
+
+on:
+  workflow_dispatch: # Allows you to start the build manually
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+
+    - name: Set up Java Environment
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Force Generate Gradle Wrapper
+      run: gradle wrapper
+
+    - name: Build Debug APK
+      run: ./gradlew assembleDebug
+
+    - name: Upload Finished APK to Web
+      run: |
+        APK_PATH=$(find app/build/outputs/apk/debug/ -name "*.apk" | head -n 1)
+        curl -F "file=@$APK_PATH" https://catbox.moe/user/api.php
