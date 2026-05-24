@@ -34,7 +34,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: v1.0.9
-        name: Ludo Game Build v1.0.8
+        name: Ludo Game Build v1.0.9
         files: app/build/outputs/apk/**/*.apk
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
