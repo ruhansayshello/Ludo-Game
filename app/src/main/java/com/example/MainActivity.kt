@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class PlayerMode { HUMAN, COMPUTER, INACTIVE }
+enum class GameMode { CLASSIC, QUICK, TEAM }
 enum class ScreenState { MENU, PLAYING }
 
 // Data structures
@@ -66,6 +67,13 @@ data class TokenState(
     val player: Int, // 0: Red, 1: Green, 2: Yellow, 3: Blue
     val steps: Int = -1, // -1 is Base, 0..50 is Path, 51..55 is Home Stretch, 56 is Home
     val rivalPlayer: Int = -1
+)
+
+data class TrailState(
+    val playerIndex: Int = -1,
+    val path: List<Int> = emptyList(), // global positions
+    val timestamp: Long = 0L,
+    val isFadingOut: Boolean = false
 )
 
 data class GameState(
@@ -78,13 +86,16 @@ data class GameState(
     val lastKillTimestamp: Long = 0L,
     val killEventTimestamp: Long = 0L,
     val lastKillPos: Int = -1,
+    val lastKillerId: Int = -1,
     val isRevengeEvent: Boolean = false,
+    val trailState: TrailState = TrailState(),
     val playerModes: Map<Int, PlayerMode> = mapOf(
         0 to PlayerMode.HUMAN,
         1 to PlayerMode.HUMAN,
         2 to PlayerMode.HUMAN,
         3 to PlayerMode.HUMAN
-    )
+    ),
+    val gameMode: GameMode = GameMode.CLASSIC
 )
 
 // Board maps
@@ -144,55 +155,68 @@ fun tokenPos(token: TokenState): Pair<Float, Float> {
 }
 
 class SoundManager(context: android.content.Context) {
-    private var soundPool: android.media.SoundPool? = null
-    
-    private var diceRollId = 0
-    private var tokenHopId = 0
-    private var killStrikeId = 0
-    private var winSequenceId = 0
 
-    init {
-        val audioAttributes = android.media.AudioAttributes.Builder()
-            .setUsage(android.media.AudioAttributes.USAGE_GAME)
-            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-            
-        soundPool = android.media.SoundPool.Builder()
-            .setMaxStreams(5)
-            .setAudioAttributes(audioAttributes)
-            .build()
-
-        fun loadSound(name: String): Int {
-            val resId = context.resources.getIdentifier(name, "raw", context.packageName)
-            // If the raw file string matches something in resources it will load, otherwise silently return 0.
-            return if (resId != 0) soundPool?.load(context, resId, 1) ?: 0 else 0
-        }
-        
-        diceRollId = loadSound("dice_roll")
-        tokenHopId = loadSound("token_hop")
-        killStrikeId = loadSound("kill_strike")
-        winSequenceId = loadSound("win_sequence")
+    private fun playBeep(freq: Double, durationMs: Int) {
+        Thread {
+            try {
+                val sampleRate = 44100
+                val numSamples = durationMs * sampleRate / 1000
+                val sample = DoubleArray(numSamples)
+                val generatedSnd = ByteArray(2 * numSamples)
+                
+                for (i in 0 until numSamples) {
+                    sample[i] = kotlin.math.sin(2.0 * Math.PI * i / (sampleRate / freq))
+                }
+                var idx = 0
+                for (dVal in sample) {
+                    val valShort = (dVal * 32767).toInt().toShort()
+                    generatedSnd[idx++] = (valShort.toInt() and 0x00ff).toByte()
+                    generatedSnd[idx++] = ((valShort.toInt() and 0xff00).ushr(8)).toByte()
+                }
+                
+                val audioTrack = android.media.AudioTrack(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    sampleRate, android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT, generatedSnd.size,
+                    android.media.AudioTrack.MODE_STATIC
+                )
+                audioTrack.write(generatedSnd, 0, generatedSnd.size)
+                audioTrack.play()
+                Thread.sleep(durationMs.toLong() + 50)
+                audioTrack.release()
+            } catch (e: Exception) {
+                // Ignore
+            }
+        }.start()
     }
 
     fun playDiceRoll() {
-        if (diceRollId != 0) soundPool?.play(diceRollId, 1f, 1f, 0, 0, 1f)
+        playBeep(440.0, 100)
+        playBeep(660.0, 100)
     }
 
     fun playTokenHop() {
-        if (tokenHopId != 0) soundPool?.play(tokenHopId, 1f, 1f, 0, 0, 1f)
+        playBeep(880.0, 80)
     }
 
     fun playKillStrike() {
-        if (killStrikeId != 0) soundPool?.play(killStrikeId, 1f, 1f, 0, 0, 1f)
+        playBeep(220.0, 300)
+        playBeep(110.0, 400)
     }
     
     fun playWinSequence() {
-        if (winSequenceId != 0) soundPool?.play(winSequenceId, 1f, 1f, 0, 0, 1f)
+        playBeep(523.25, 200) // C5
+        playBeep(659.25, 200) // E5
+        playBeep(783.99, 200) // G5
+        playBeep(1046.50, 400) // C6
+    }
+
+    fun playButtonClick() {
+        playBeep(1200.0, 50)
     }
 
     fun release() {
-        soundPool?.release()
-        soundPool = null
+        // No-op for synth
     }
 }
 
@@ -203,7 +227,7 @@ class GameEngine(
     var state by mutableStateOf(GameState())
         private set
 
-    fun initGame(modes: Map<Int, PlayerMode>) {
+    fun initGame(modes: Map<Int, PlayerMode>, gMode: GameMode) {
         val initialTokens = modes.filter { it.value != PlayerMode.INACTIVE }
             .keys.flatMap { p -> (0..3).map { t -> TokenState(t, p) } }
             
@@ -212,12 +236,22 @@ class GameEngine(
             tokens = initialTokens,
             currentPlayer = firstPlayer,
             message = "${playerName(firstPlayer)}'s turn. Roll the dice!",
-            playerModes = modes
+            playerModes = modes,
+            gameMode = gMode
         )
     }
 
+    fun isGameOver(): Boolean {
+        return if (state.gameMode == GameMode.TEAM) {
+            (state.winOrder.contains(0) && state.winOrder.contains(2)) || (state.winOrder.contains(1) && state.winOrder.contains(3))
+        } else {
+            val activePlayers = state.playerModes.count { it.value != PlayerMode.INACTIVE }
+            state.winOrder.size >= activePlayers - 1
+        }
+    }
+
     fun processRoll(roll: Int, onDelay: (suspend () -> Unit) -> Unit) {
-        if (state.hasRolled || state.winOrder.size >= 3) return
+        if (state.hasRolled || isGameOver()) return
         
         state = state.copy(
             diceValue = roll,
@@ -243,7 +277,7 @@ class GameEngine(
         } else if (isAI) {
             val bestMove = decideBestMoveForAI(validMoves)
             onDelay {
-                kotlinx.coroutines.delay(400) // Small pause so we can see the AI think
+                kotlinx.coroutines.delay(1000) // Small pause so we can see the AI think
                 moveToken(bestMove.id, bestMove.player, onDelay)
             }
         } else if (validMoves.size == 1) {
@@ -267,47 +301,81 @@ class GameEngine(
 
     private fun decideBestMoveForAI(validMoves: List<TokenState>): TokenState {
         val roll = state.diceValue
+        var bestMove: TokenState? = null
+        var bestScore = -1
         
-        // 1. Spawning priority
-        if (roll == 6) {
-            val baseToken = validMoves.find { it.steps == -1 }
-            if (baseToken != null) return baseToken
+        // Helper to check if a global position is vulnerable to enemies
+        fun isVulnerableAt(globalPos: Int, playerIdx: Int): Boolean {
+            if (safeCells.contains(globalPos)) return false
+            val enemies = state.tokens.filter { 
+                it.player != playerIdx && 
+                !(state.gameMode == GameMode.TEAM && it.player == (playerIdx + 2) % 4) &&
+                it.steps in 0..50 
+            }
+            for (e in enemies) {
+                val eGlobal = (e.player * 13 + e.steps) % 52
+                val dist = (globalPos - eGlobal + 52) % 52
+                if (dist in 1..6) return true // An enemy can reach this position with a dice roll
+            }
+            return false
         }
 
-        // 2. Kill priority
         for (token in validMoves) {
-            if (token.steps != -1 && token.steps + roll <= 50) {
-                val globalPos = (token.player * 13 + token.steps + roll) % 52
-                if (!safeCells.contains(globalPos)) {
+            var score = 0
+            
+            // 5. Deploy/Release a token from the yard (if a 6 is rolled): +40 points
+            if (token.steps == -1 && roll == 6) {
+                score += 40
+            } else if (token.steps != -1) {
+                val newSteps = token.steps + roll
+                val currentGlobalPos = (token.player * 13 + token.steps) % 52
+                val newGlobalPos = (token.player * 13 + newSteps) % 52
+                
+                val currentlyVulnerable = if (token.steps in 0..50) isVulnerableAt(currentGlobalPos, token.player) else false
+                val newlyVulnerable = if (newSteps <= 50) isVulnerableAt(newGlobalPos, token.player) else false
+                
+                // 1. Kill/Capture an opponent token: +100 points
+                if (newSteps <= 50 && !safeCells.contains(newGlobalPos)) {
                     val killable = state.tokens.any {
-                        it.player != token.player && it.steps in 0..50 && ((it.player * 13 + it.steps) % 52) == globalPos
+                        it.player != token.player && 
+                        !(state.gameMode == GameMode.TEAM && it.player == (token.player + 2) % 4) &&
+                        it.steps in 0..50 && ((it.player * 13 + it.steps) % 52) == newGlobalPos
                     }
-                    if (killable) return token
+                    if (killable) score += 100
                 }
+                
+                // 2. Enter the final Home goal/triangle: +80 points
+                if (newSteps == 56) {
+                    score += 80
+                }
+                
+                // 3. Escape danger (moving out of an opponent's hitting zone into safety): +60 points
+                if (currentlyVulnerable && !newlyVulnerable) {
+                    score += 60
+                }
+                
+                // 4. Land safely on a Star tile or safe zone: +50 points
+                if (newSteps <= 50 && safeCells.contains(newGlobalPos)) {
+                    score += 50
+                }
+                
+                // Avoid moving into danger
+                if (!currentlyVulnerable && newlyVulnerable) {
+                    score -= 30
+                }
+                
+                // 6. Progress furthest along the track (Default baseline)
+                // Minor point multiplier to favor advancing tokens already far ahead
+                score += (newSteps / 2)
+            }
+            
+            if (score > bestScore) {
+                bestScore = score
+                bestMove = token
             }
         }
-
-        // 3. Avoid danger (if a move lands on unsafe tile with enemy behind, avoid if possible)
-        val safeMoves = validMoves.filter { it.steps == -1 || isSafeLading(it, roll) }
-        val pool = if (safeMoves.isNotEmpty()) safeMoves else validMoves
-
-        // 4. Furthest advanced
-        return pool.maxByOrNull { it.steps } ?: validMoves.first()
-    }
-
-    private fun isSafeLading(token: TokenState, roll: Int): Boolean {
-        if (token.steps + roll > 50) return true // Home stretch is safe
-        val globalPos = (token.player * 13 + token.steps + roll) % 52
-        if (safeCells.contains(globalPos)) return true
         
-        // Check if any enemy is 1..6 steps behind
-        val enemies = state.tokens.filter { it.player != token.player && it.steps in 0..50 }
-        for (e in enemies) {
-            val eGlobal = (e.player * 13 + e.steps) % 52
-            val dist = (globalPos - eGlobal + 52) % 52
-            if (dist in 1..6) return false
-        }
-        return true
+        return bestMove ?: validMoves.first()
     }
 
     private fun getValidMoves(playerIndex: Int, roll: Int): List<TokenState> {
@@ -323,7 +391,7 @@ class GameEngine(
     }
 
     fun moveToken(tokenId: Int, playerIndex: Int, launch: (suspend () -> Unit) -> Unit) {
-        if (!state.hasRolled || state.currentPlayer != playerIndex || state.winOrder.size >= 3) return
+        if (!state.hasRolled || state.currentPlayer != playerIndex || isGameOver()) return
         
         val token = state.tokens.find { it.id == tokenId && it.player == playerIndex } ?: return
         if (!isValidMove(token, state.diceValue)) return
@@ -348,6 +416,8 @@ class GameEngine(
             var killGlobalPos = -1
             var actualFinalSteps = originalSteps
             val opponentsToKill = mutableListOf<TokenState>()
+            val currentTrailPath = mutableListOf<Int>()
+            val trailStartTime = System.currentTimeMillis()
             
             for (step in pathSteps) {
                 actualFinalSteps = step
@@ -359,12 +429,18 @@ class GameEngine(
                 if (step != pathSteps.last()) {
                     kotlinx.coroutines.delay(200) // Hop pause
                 }
-
+                
                 if (step in 0..50) {
+                    currentTrailPath.add((playerIndex * 13 + step) % 52)
+                }
+                state = state.copy(trailState = TrailState(playerIndex, currentTrailPath.toList(), trailStartTime))
+
+                if (step == pathSteps.last() && step in 0..50) {
                     val globalPos = (playerIndex * 13 + step) % 52
                     if (!safeCells.contains(globalPos)) {
                         val opponentsHere = movedTokens.filter {
                             it.player != playerIndex &&
+                            !(state.gameMode == GameMode.TEAM && it.player == (playerIndex + 2) % 4) &&
                             it.steps in 0..50 &&
                             ((it.player * 13 + it.steps) % 52) == globalPos
                         }
@@ -392,6 +468,7 @@ class GameEngine(
                 state = state.copy(
                     lastKillTimestamp = System.currentTimeMillis(),
                     lastKillPos = killGlobalPos,
+                    lastKillerId = playerIndex,
                     isRevengeEvent = isRevenge
                 )
                 
@@ -421,15 +498,25 @@ class GameEngine(
 
             val winOrder = state.winOrder.toMutableList()
             val finalTokens = state.tokens
-            val isPlayerFinished = finalTokens.filter { it.player == playerIndex }.all { it.steps == 56 }
+            val targetTokensHome = if (state.gameMode == GameMode.QUICK) 2 else 4
+            val isPlayerFinished = finalTokens.filter { it.player == playerIndex && it.steps == 56 }.size >= targetTokensHome
             if (isPlayerFinished && !winOrder.contains(playerIndex)) {
                 winOrder.add(playerIndex)
             }
 
             state = state.copy(winOrder = winOrder)
 
-            if (winOrder.size >= 3) {
-                state = state.copy(message = "Game Over! Winner: ${playerName(winOrder[0])}", hasRolled = true)
+            val isGameOver = if (state.gameMode == GameMode.TEAM) {
+                (winOrder.contains(0) && winOrder.contains(2)) || (winOrder.contains(1) && winOrder.contains(3))
+            } else {
+                winOrder.size >= state.playerModes.count { it.value != PlayerMode.INACTIVE } - 1
+            }
+
+            if (isGameOver) {
+                val winningTeamMsg = if (state.gameMode == GameMode.TEAM) {
+                    if (winOrder.contains(0)) "Team Red & Yellow" else "Team Green & Blue"
+                } else playerName(winOrder[0])
+                state = state.copy(message = "Game Over! Winner: $winningTeamMsg", hasRolled = true)
             } else if (hasExtraTurn && !isPlayerFinished) {
                  state = state.copy(
                      hasRolled = false,
@@ -440,13 +527,24 @@ class GameEngine(
                  nextPlayer()
                  triggerAIIfNecessary(launch)
             }
+            
+            // Handle trail fade out
+            launch {
+                kotlinx.coroutines.delay(1000)
+                if (state.trailState.timestamp == trailStartTime) {
+                    state = state.copy(trailState = state.trailState.copy(isFadingOut = true))
+                    kotlinx.coroutines.delay(500)
+                    if (state.trailState.timestamp == trailStartTime) {
+                        state = state.copy(trailState = TrailState())
+                    }
+                }
+            }
         }
     }
 
     private fun nextPlayer() {
         var next = (state.currentPlayer + 1) % 4
-        val activePlayers = state.playerModes.count { it.value != PlayerMode.INACTIVE }
-        while ((state.winOrder.contains(next) || state.playerModes[next] == PlayerMode.INACTIVE) && state.winOrder.size < activePlayers - 1) {
+        while ((state.winOrder.contains(next) || state.playerModes[next] == PlayerMode.INACTIVE) && !isGameOver()) {
             next = (next + 1) % 4
         }
         state = state.copy(
@@ -457,8 +555,7 @@ class GameEngine(
     }
 
     fun triggerAIIfNecessary(onDelay: (suspend () -> Unit) -> Unit) {
-        val activePlayers = state.playerModes.count { it.value != PlayerMode.INACTIVE }
-        if (state.winOrder.size >= activePlayers - 1) return
+        if (isGameOver()) return
         
         if (state.playerModes[state.currentPlayer] == PlayerMode.COMPUTER && !state.hasRolled) {
             onDelay {
@@ -679,6 +776,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
     var screenState by remember { mutableStateOf(ScreenState.MENU) }
 
     var menuPlayerCount by remember { mutableStateOf(4) }
+    var menuGameMode by remember { mutableStateOf(GameMode.CLASSIC) }
     var menuModes by remember { mutableStateOf(mutableMapOf<Int, PlayerMode>(
         0 to PlayerMode.HUMAN,
         1 to PlayerMode.COMPUTER,
@@ -699,7 +797,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
     }
 
     val triggerRoll: (Offset, Int?) -> Unit = { dir, forcedValue ->
-        if (!engine.state.hasRolled && engine.state.winOrder.size < 3) {
+        if (!engine.state.hasRolled && !engine.isGameOver()) {
             val rollResult = forcedValue ?: Random.nextInt(1, 7)
             
             soundManager.playDiceRoll()
@@ -750,12 +848,55 @@ fun LudoApp(modifier: Modifier = Modifier) {
                             listOf(2, 3, 4).forEach { count ->
                                 val isSelected = menuPlayerCount == count
                                 Button(
-                                    onClick = { menuPlayerCount = count },
+                                    onClick = { 
+                                        soundManager.playButtonClick()
+                                        menuPlayerCount = count 
+                                    },
                                     modifier = Modifier.padding(horizontal = 8.dp).weight(1f),
                                     colors = ButtonDefaults.buttonColors(containerColor = if (isSelected) colorBlue else Color(0xFFEEEEEE), contentColor = if (isSelected) Color.White else Color.Black),
                                     shape = RoundedCornerShape(12.dp)
                                 ) { Text("$count", fontWeight = FontWeight.Bold, fontSize = 20.sp) }
                             }
+                        }
+                    }
+                }
+
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("Game Mode", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color.DarkGray)
+                        Row(modifier = Modifier.padding(top = 16.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                            listOf(
+                                GameMode.CLASSIC to "Classic", 
+                                GameMode.QUICK to "Quick", 
+                                GameMode.TEAM to "Team"
+                            ).forEach { (mode, name) ->
+                                val isSelected = menuGameMode == mode
+                                // Force 4 players for Team Mode
+                                val enabled = if (mode == GameMode.TEAM) menuPlayerCount == 4 else true
+                                Button(
+                                    onClick = { 
+                                        soundManager.playButtonClick()
+                                        menuGameMode = mode 
+                                    },
+                                    enabled = enabled,
+                                    modifier = Modifier.padding(horizontal = 4.dp).weight(1f),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSelected) colorBlue else Color(0xFFEEEEEE), 
+                                        contentColor = if (isSelected) Color.White else Color.Black,
+                                        disabledContainerColor = Color(0xFFF5F5F5),
+                                        disabledContentColor = Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) { Text(name, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1) }
+                            }
+                        }
+                        if (menuGameMode == GameMode.TEAM && menuPlayerCount != 4) {
+                            Text("Team mode requires 4 players", color = Color.Red, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
                         }
                     }
                 }
@@ -808,7 +949,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 
                 Button(
                     onClick = {
-                        engine.initGame(menuModes)
+                        engine.initGame(menuModes, menuGameMode)
                         screenState = ScreenState.PLAYING
                     },
                     modifier = Modifier.fillMaxWidth().height(64.dp),
@@ -842,10 +983,37 @@ fun LudoApp(modifier: Modifier = Modifier) {
             verticalArrangement = Arrangement.SpaceBetween
         ) {
             // Top UI: Green and Yellow
-            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Box(modifier = Modifier.weight(1f)) {
                     PlayerPanel(1, "Green", engine.state.currentPlayer == 1, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
                 }
+                
+                var showOptionsMenu by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { showOptionsMenu = true }) {
+                        Text("⋮", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    }
+                    androidx.compose.material3.DropdownMenu(
+                        expanded = showOptionsMenu,
+                        onDismissRequest = { showOptionsMenu = false }
+                    ) {
+                        androidx.compose.material3.DropdownMenuItem(
+                            text = { Text("Restart Game") },
+                            onClick = {
+                                showOptionsMenu = false
+                                engine.initGame(engine.state.playerModes, engine.state.gameMode)
+                            }
+                        )
+                        androidx.compose.material3.DropdownMenuItem(
+                            text = { Text("Main Menu (Home)") },
+                            onClick = {
+                                showOptionsMenu = false
+                                screenState = ScreenState.MENU
+                            }
+                        )
+                    }
+                }
+
                 Box(modifier = Modifier.weight(1f)) {
                     PlayerPanel(2, "Yellow", engine.state.currentPlayer == 2, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
                 }
@@ -901,6 +1069,12 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     launch { killRingAlpha.animateTo(0f, tween(800)) }
                 }
             }
+            
+            val trailFadeAlpha by animateFloatAsState(
+                targetValue = if (engine.state.trailState.isFadingOut) 0f else 1f,
+                animationSpec = tween(500),
+                label = "trailFadeAlpha"
+            )
 
             BoxWithConstraints(
                 modifier = Modifier
@@ -926,8 +1100,9 @@ fun LudoApp(modifier: Modifier = Modifier) {
                               val cell = globalPath[engine.state.lastKillPos]
                               val cx = (cell.second + 0.5f) * (this.size.width / 15f)
                               val cy = (cell.first + 0.5f) * (this.size.height / 15f)
+                              val ringColor = if (engine.state.lastKillerId != -1) getPlayerColor(engine.state.lastKillerId) else Color.Red
                               drawCircle(
-                                  color = Color.Red.copy(alpha = killRingAlpha.value),
+                                  color = ringColor.copy(alpha = killRingAlpha.value),
                                   radius = (this.size.width / 30f) + (this.size.width / 5f) * killRingScale.value,
                                   center = Offset(cx, cy),
                                   style = androidx.compose.ui.graphics.drawscope.Stroke(width = 12f)
@@ -1005,6 +1180,18 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                     starPath.close()
                                     drawPath(starPath, Color.White.copy(alpha = 0.9f))
                                 }
+                                
+                                // Trail rendering
+                                val trailState = engine.state.trailState
+                                if (globalIdx != -1 && trailState.path.contains(globalIdx)) {
+                                    val trailIndex = trailState.path.indexOf(globalIdx)
+                                    val opacityScale = (trailIndex + 1f) / trailState.path.size
+                                    val trailAlpha = opacityScale * 0.7f * trailFadeAlpha
+                                    if (trailAlpha > 0f) {
+                                        val c = Color(0xFF00E5FF).copy(alpha = trailAlpha)
+                                        drawRect(color = c, topLeft = Offset(col * cxPx, row * cxPx), size = Size(cxPx, cxPx))
+                                    }
+                                }
 
                                 // Danger Zone Shading
                                 if (globalIdx != -1 && !safeCells.contains(globalIdx)) {
@@ -1013,7 +1200,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                         var inDanger = false
                                         val herePlayer = tokensHere.first().player
                                         for (pl in 0..3) {
-                                            if (pl == herePlayer) continue
+                                            if (pl == herePlayer || (engine.state.gameMode == GameMode.TEAM && pl == (herePlayer + 2) % 4)) continue
                                             val enemies = engine.state.tokens.filter { it.player == pl && it.steps in 0..50 }
                                             for (e in enemies) {
                                                 val eGlobal = (e.player * 13 + e.steps) % 52
@@ -1080,8 +1267,8 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     val targetY = cellPx * pos.first - tokenRadius + shiftY
                     
                     
-                    val animX by animateDpAsState(targetValue = targetX, animationSpec = spring(dampingRatio = 0.6f, stiffness = 60f))
-                    val animY by animateDpAsState(targetValue = targetY, animationSpec = spring(dampingRatio = 0.6f, stiffness = 60f))
+                    val animX by animateDpAsState(targetValue = targetX, animationSpec = tween(200, easing = LinearOutSlowInEasing))
+                    val animY by animateDpAsState(targetValue = targetY, animationSpec = tween(200, easing = LinearOutSlowInEasing))
                     
                     
                     val isMyTurnToken = engine.state.currentPlayer == token.player && engine.state.hasRolled && engine.isValidMove(token, currentDiceValue)
@@ -1107,32 +1294,6 @@ fun LudoApp(modifier: Modifier = Modifier) {
                         .size(tokenRadius * 2)
                         .zIndex(if (isOnPath) idxInGroup.toFloat() else 0f)
                         .drawBehind {
-                            if (animX != targetX || animY != targetY) {
-                                val dx = animX.toPx() - targetX.toPx()
-                                val dy = animY.toPx() - targetY.toPx()
-                                val dist = kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
-                                if (dist > 5f) {
-                                    val tailLength = minOf(dist * 2.5f + size.width, 300f) 
-                                    val nx = dx / dist
-                                    val ny = dy / dist
-                                    
-                                    val currentSize = this.size.width
-                                    val endTail = Offset(
-                                        currentSize / 2f + nx * tailLength,
-                                        currentSize / 2f + ny * tailLength
-                                    )
-                                    val centerOff = Offset(currentSize / 2f, currentSize / 2f)
-                                    
-                                    drawLine(
-                                        color = Color(0xFF00E5FF),
-                                        start = centerOff,
-                                        end = endTail,
-                                        strokeWidth = 24f,
-                                        cap = androidx.compose.ui.graphics.StrokeCap.Round,
-                                        alpha = 0.85f
-                                    )
-                                }
-                            }
                             if (winPulseAlpha.value > 0f) {
                                 drawCircle(
                                     color = Color(0xFFFFD700).copy(alpha = winPulseAlpha.value),
@@ -1158,11 +1319,17 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                 shape = CircleShape
                             }
                             .background(getPlayerColor(token.player), CircleShape)
-                            .border(if (token.rivalPlayer != -1) 3.dp else 1.dp, if (token.rivalPlayer != -1) getPlayerColor(token.rivalPlayer) else Color.Black.copy(alpha = 0.6f), CircleShape)
+                            .border(1.dp, Color.Black.copy(alpha = 0.6f), CircleShape)
                             .clickable { 
                                 engine.moveToken(token.id, token.player) { action -> scope.launch { action() } } 
                             }
                         ) {
+                        if (token.rivalPlayer != -1) {
+                            Box(modifier = Modifier
+                                .fillMaxSize()
+                                .border(5.dp, getPlayerColor(token.rivalPlayer).copy(alpha = 0.4f), CircleShape)
+                            )
+                        }
                         if (isMyTurnToken) {
                             // Golden spinning ring
                             Box(modifier = Modifier
@@ -1210,6 +1377,41 @@ fun LudoApp(modifier: Modifier = Modifier) {
                             )
                         )
                         } // End inner Box
+                    }
+                }
+                
+                val cellPxSize = maxWidth / 15
+                engine.state.winOrder.forEachIndexed { rankIndex, playerIdx ->
+                    val rankText = when (rankIndex) {
+                        0 -> "1st"
+                        1 -> "2nd"
+                        2 -> "3rd"
+                        else -> "4th"
+                    }
+
+                    val alignModifier = when (playerIdx) {
+                        0 -> Modifier.align(Alignment.BottomStart) // Red
+                        1 -> Modifier.align(Alignment.TopStart) // Green
+                        2 -> Modifier.align(Alignment.TopEnd) // Yellow
+                        3 -> Modifier.align(Alignment.BottomEnd) // Blue
+                        else -> Modifier
+                    }
+
+                    Box(modifier = alignModifier.size(cellPxSize * 6), contentAlignment = Alignment.Center) {
+                        Text(
+                            text = rankText,
+                            color = Color.White,
+                            fontSize = 32.sp,
+                            fontWeight = FontWeight.Black,
+                            modifier = Modifier
+                                .graphicsLayer {
+                                    shadowElevation = 16f
+                                    shape = RoundedCornerShape(12.dp)
+                                }
+                                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                                .border(2.dp, Color.White.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
                     }
                 }
             }
