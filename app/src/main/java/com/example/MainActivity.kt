@@ -97,6 +97,12 @@ data class GameState(
         2 to PlayerMode.HUMAN,
         3 to PlayerMode.HUMAN
     ),
+    val playerColors: Map<Int, Int> = mapOf(
+        0 to 0,
+        1 to 1,
+        2 to 2,
+        3 to 3
+    ),
     val gameMode: GameMode = GameMode.CLASSIC,
     val rocketBoostToken: Pair<Int, Int>? = null
 )
@@ -249,7 +255,7 @@ class GameEngine(
     var state by mutableStateOf(GameState())
         private set
 
-    fun initGame(modes: Map<Int, PlayerMode>, gMode: GameMode) {
+    fun initGame(modes: Map<Int, PlayerMode>, colors: Map<Int, Int>, gMode: GameMode) {
         val initialTokens = modes.filter { it.value != PlayerMode.INACTIVE }
             .keys.flatMap { p -> (0..3).map { t -> TokenState(t, p) } }
             
@@ -259,6 +265,7 @@ class GameEngine(
             currentPlayer = firstPlayer,
             message = "${playerName(firstPlayer)}'s turn. Roll the dice!",
             playerModes = modes,
+            playerColors = colors,
             gameMode = gMode
         )
     }
@@ -442,9 +449,22 @@ class GameEngine(
             val trailStartTime = System.currentTimeMillis()
             
             var willKill = false
-            if (pathSteps.isNotEmpty() && pathSteps.last() in 0..50) {
+            if (pathSteps.isNotEmpty()) {
                 val endGlobalPos = (playerIndex * 13 + pathSteps.last()) % 52
-                if (!safeCells.contains(endGlobalPos)) {
+                if (state.gameMode == GameMode.QUICK) {
+                    for (ps in pathSteps) {
+                        if (ps in 0..50) {
+                            val gp = (playerIndex * 13 + ps) % 52
+                            if (!safeCells.contains(gp)) {
+                                val hasKill = movedTokens.any {
+                                    it.player != playerIndex &&
+                                    it.steps in 0..50 && ((it.player * 13 + it.steps) % 52) == gp
+                                }
+                                if (hasKill) { willKill = true; break }
+                            }
+                        }
+                    }
+                } else if (pathSteps.last() in 0..50 && !safeCells.contains(endGlobalPos)) {
                     willKill = movedTokens.any {
                         it.player != playerIndex &&
                         !(state.gameMode == GameMode.TEAM && it.player == (playerIndex + 2) % 4) &&
@@ -473,7 +493,7 @@ class GameEngine(
                 }
                 state = state.copy(trailState = TrailState(playerIndex, currentTrailPath.toList(), trailStartTime))
 
-                if (step == pathSteps.last() && step in 0..50) {
+                if ((step == pathSteps.last() || state.gameMode == GameMode.QUICK) && step in 0..50) {
                     val globalPos = (playerIndex * 13 + step) % 52
                     if (!safeCells.contains(globalPos)) {
                         val opponentsHere = movedTokens.filter {
@@ -483,10 +503,12 @@ class GameEngine(
                             ((it.player * 13 + it.steps) % 52) == globalPos
                         }
                         if (opponentsHere.isNotEmpty()) {
-                            opponentsToKill.add(opponentsHere.first())
+                            opponentsToKill.addAll(opponentsHere)
                             killedOpponent = true
                             killGlobalPos = globalPos
-                            break
+                            if (!(state.gameMode == GameMode.QUICK && step != pathSteps.last())) {
+                                break
+                            }
                         }
                     }
                 }
@@ -605,12 +627,15 @@ class GameEngine(
         }
     }
 
-    fun playerName(index: Int) = when(index) {
-        0 -> "Red"
-        1 -> "Green"
-        2 -> "Yellow"
-        3 -> "Blue"
-        else -> "Unknown"
+    fun playerName(index: Int): String {
+        val mappedColorIdx = state.playerColors[index] ?: index
+        return when(mappedColorIdx) {
+            0 -> "Red"
+            1 -> "Green"
+            2 -> "Yellow"
+            3 -> "Blue"
+            else -> "Unknown"
+        }
     }
 }
 
@@ -619,14 +644,14 @@ val colorGreen = Color(0xFF00C853)
 val colorYellow = Color(0xFFFFEA00)
 val colorBlue = Color(0xFF2962FF)
 
-fun getPlayerColor(player: Int) = when(player) {
+fun getPlayerColor(player: Int, overrides: Map<Int, Int> = emptyMap()) = when(overrides[player] ?: player) {
     0 -> colorRed
     1 -> colorGreen
     2 -> colorYellow
     3 -> colorBlue
     else -> Color.Black
 }
-fun getPlayerLightColor(player: Int) = when(player) {
+fun getPlayerLightColor(player: Int, overrides: Map<Int, Int> = emptyMap()) = when(overrides[player] ?: player) {
     0 -> Color(0xFFFF8A80)
     1 -> Color(0xFFB9F6CA)
     2 -> Color(0xFFFFFF8D)
@@ -668,9 +693,9 @@ fun PlayerPanel(
     diceVisible: Boolean,
     rollTrigger: Int,
     timeRemainingMs: Long,
+    color: Color,
     onRoll: (Offset, Int?) -> Unit
 ) {
-    val color = getPlayerColor(playerIdx)
     val alpha by animateFloatAsState(if (isActive) 1f else 0.4f)
     val scale by animateFloatAsState(if (isActive) 1.05f else 1f)
     
@@ -838,6 +863,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
         2 to PlayerMode.HUMAN,
         3 to PlayerMode.COMPUTER
     )) }
+    var menuColors by remember { mutableStateOf(mutableMapOf<Int, Int>(0 to 0, 1 to 1, 2 to 2, 3 to 3)) }
 
     LaunchedEffect(engine.state.tokens, engine.state.currentPlayer) {
         diceVisible = false
@@ -940,6 +966,12 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                     onClick = { 
                                         soundManager.playButtonClick()
                                         menuGameMode = mode 
+                                        if (mode == GameMode.TEAM) {
+                                            val newColors = menuColors.toMutableMap()
+                                            newColors[2] = newColors[0] ?: 0
+                                            newColors[3] = newColors[1] ?: 1
+                                            menuColors = newColors
+                                        }
                                     },
                                     enabled = enabled,
                                     modifier = Modifier.padding(horizontal = 4.dp).weight(1f),
@@ -960,10 +992,14 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 }
                 
                 // Map 2-player to index 0, 2; 3-player to 0, 1, 2; 4-player 0, 1, 2, 3.
-                val activeIndices = when (menuPlayerCount) {
-                    2 -> listOf(0, 2)
-                    3 -> listOf(0, 1, 2)
-                    else -> listOf(0, 1, 2, 3)
+                val activeIndices = if (menuGameMode == GameMode.TEAM) {
+                    listOf(0, 1, 2, 3)
+                } else {
+                    when (menuPlayerCount) {
+                        2 -> listOf(0, 2)
+                        3 -> listOf(0, 1, 2)
+                        else -> listOf(0, 1, 2, 3)
+                    }
                 }
                 
                 Card(
@@ -983,23 +1019,41 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                     modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
                                 ) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Box(modifier = Modifier.size(16.dp).background(getPlayerColor(pIdx), CircleShape))
+                                        Box(
+                                            modifier = Modifier
+                                                .size(24.dp)
+                                                .background(getPlayerColor(pIdx, menuColors), CircleShape)
+                                                .border(2.dp, Color.Black.copy(alpha=0.2f), CircleShape)
+                                                .clickable {
+                                                    val nextCol = ((menuColors[pIdx] ?: pIdx) + 1) % 4
+                                                    val newColors = menuColors.toMutableMap()
+                                                    newColors[pIdx] = nextCol
+                                                    if (menuGameMode == GameMode.TEAM) {
+                                                        newColors[(pIdx + 2) % 4] = nextCol
+                                                    }
+                                                    menuColors = newColors
+                                                    soundManager.playButtonClick()
+                                                }
+                                        )
                                         Spacer(modifier = Modifier.width(12.dp))
-                                        Text(engine.playerName(pIdx), color = Color.DarkGray, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                        Text(if (menuGameMode == GameMode.TEAM) "Team ${(pIdx % 2) + 1} - P${pIdx + 1}" else engine.playerName(pIdx), color = Color.DarkGray, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                                     }
                                     
                                     val currentMode = menuModes[pIdx] ?: PlayerMode.HUMAN
                                     OutlinedButton(
                                         onClick = {
                                             soundManager.playButtonClick()
-                                            menuModes = menuModes.toMutableMap().apply { this[pIdx] = if (currentMode == PlayerMode.HUMAN) PlayerMode.COMPUTER else PlayerMode.HUMAN }
+                                            val newMode = if (currentMode == PlayerMode.HUMAN) PlayerMode.COMPUTER else PlayerMode.HUMAN
+                                            val newModes = menuModes.toMutableMap()
+                                            newModes[pIdx] = newMode
+                                            menuModes = newModes
                                         },
                                         colors = ButtonDefaults.outlinedButtonColors(containerColor = if (currentMode == PlayerMode.COMPUTER) Color(0xFFF3E5F5) else Color.Transparent),
                                         shape = RoundedCornerShape(12.dp),
                                         border = androidx.compose.foundation.BorderStroke(1.dp, if (currentMode == PlayerMode.COMPUTER) Color(0xFF9C27B0) else Color.LightGray)
                                     ) { Text(if (currentMode == PlayerMode.HUMAN) "👤 HUMAN" else "🤖 CPU", color = if (currentMode == PlayerMode.COMPUTER) Color(0xFF9C27B0) else Color.Gray, fontWeight = FontWeight.Bold) }
                                 }
-                            } else {
+                            } else if (menuGameMode != GameMode.TEAM) {
                                 menuModes[pIdx] = PlayerMode.INACTIVE
                             }
                         }
@@ -1009,7 +1063,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 Button(
                     onClick = {
                         soundManager.playButtonClick()
-                        engine.initGame(menuModes, menuGameMode)
+                        engine.initGame(menuModes, menuColors, menuGameMode)
                         screenState = ScreenState.PLAYING
                     },
                     modifier = Modifier.fillMaxWidth().height(64.dp),
@@ -1048,7 +1102,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
             // Top UI: Green and Yellow
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(1, "Green", engine.state.currentPlayer == 1, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
+                    PlayerPanel(1, engine.playerName(1), engine.state.currentPlayer == 1, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, getPlayerColor(1, engine.state.playerColors), triggerRoll)
                 }
                 
                 var showOptionsMenu by remember { mutableStateOf(false) }
@@ -1064,7 +1118,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                             text = { Text("Restart Game") },
                             onClick = {
                                 showOptionsMenu = false
-                                engine.initGame(engine.state.playerModes, engine.state.gameMode)
+                                engine.initGame(engine.state.playerModes, engine.state.playerColors, engine.state.gameMode)
                             }
                         )
                         androidx.compose.material3.DropdownMenuItem(
@@ -1078,7 +1132,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 }
 
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(2, "Yellow", engine.state.currentPlayer == 2, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
+                    PlayerPanel(2, engine.playerName(2), engine.state.currentPlayer == 2, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, getPlayerColor(2, engine.state.playerColors), triggerRoll)
                 }
             }
 
@@ -1164,7 +1218,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                               val cell = globalPath[engine.state.lastKillPos]
                               val cx = (cell.second + 0.5f) * (this.size.width / 15f)
                               val cy = (cell.first + 0.5f) * (this.size.height / 15f)
-                              val ringColor = if (engine.state.lastKillerId != -1) getPlayerColor(engine.state.lastKillerId) else Color.Red
+                              val ringColor = if (engine.state.lastKillerId != -1) getPlayerColor(engine.state.lastKillerId, engine.state.playerColors) else Color.Red
                               drawCircle(
                                   color = ringColor.copy(alpha = killRingAlpha.value),
                                   radius = (this.size.width / 30f) + (this.size.width / 5f) * killRingScale.value,
@@ -1180,10 +1234,10 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     val cxPx = size.width / 15f
                     
                     // Draw background bases
-                    drawRect(color = getPlayerColor(0), topLeft = Offset(0f, 9 * cxPx), size = Size(6 * cxPx, 6 * cxPx))
-                    drawRect(color = getPlayerColor(1), topLeft = Offset(0f, 0f), size = Size(6 * cxPx, 6 * cxPx))
-                    drawRect(color = getPlayerColor(2), topLeft = Offset(9 * cxPx, 0f), size = Size(6 * cxPx, 6 * cxPx))
-                    drawRect(color = getPlayerColor(3), topLeft = Offset(9 * cxPx, 9 * cxPx), size = Size(6 * cxPx, 6 * cxPx))
+                    drawRect(color = getPlayerColor(0, engine.state.playerColors), topLeft = Offset(0f, 9 * cxPx), size = Size(6 * cxPx, 6 * cxPx))
+                    drawRect(color = getPlayerColor(1, engine.state.playerColors), topLeft = Offset(0f, 0f), size = Size(6 * cxPx, 6 * cxPx))
+                    drawRect(color = getPlayerColor(2, engine.state.playerColors), topLeft = Offset(9 * cxPx, 0f), size = Size(6 * cxPx, 6 * cxPx))
+                    drawRect(color = getPlayerColor(3, engine.state.playerColors), topLeft = Offset(9 * cxPx, 9 * cxPx), size = Size(6 * cxPx, 6 * cxPx))
                     
                     // Draw Base white inner squares Center backgrounds
                     listOf(Offset(1f, 10f), Offset(1f, 1f), Offset(10f, 1f), Offset(10f, 10f)).forEach {
@@ -1193,7 +1247,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     
                     // Draw token resting circles in bases
                     basePositions.forEachIndexed { pIdx, positions ->
-                        val color = getPlayerColor(pIdx)
+                        val color = getPlayerColor(pIdx, engine.state.playerColors)
                         positions.forEach {
                             drawCircle(color = color, radius = cxPx * 0.45f, center = Offset(it.second * cxPx, it.first * cxPx))
                             drawCircle(color = Color.Black.copy(alpha = 0.4f), radius = cxPx * 0.45f, center = Offset(it.second * cxPx, it.first * cxPx), style = Stroke(width = 3f))
@@ -1210,16 +1264,16 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                 val globalIdx = globalPath.indexOf(Pair(row, col))
                                 if (globalIdx in safeCells) {
                                     cellColor = when (globalIdx) {
-                                        0, 47 -> getPlayerColor(0)
-                                        13, 8 -> getPlayerColor(1)
-                                        26, 21 -> getPlayerColor(2)
-                                        39, 34 -> getPlayerColor(3)
+                                        0, 47 -> getPlayerColor(0, engine.state.playerColors)
+                                        13, 8 -> getPlayerColor(1, engine.state.playerColors)
+                                        26, 21 -> getPlayerColor(2, engine.state.playerColors)
+                                        39, 34 -> getPlayerColor(3, engine.state.playerColors)
                                         else -> Color.LightGray
                                     }
                                 } else {
                                     for(p in 0..3) {
                                         if (homeStretches[p].contains(Pair(row, col))) {
-                                            cellColor = getPlayerColor(p)
+                                            cellColor = getPlayerColor(p, engine.state.playerColors)
                                         }
                                     }
                                 }
@@ -1290,16 +1344,16 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     val centerY = 7.5f * cxPx
                     
                     val pathTop = Path().apply { moveTo(6 * cxPx, 6 * cxPx); lineTo(9 * cxPx, 6 * cxPx); lineTo(centerX, centerY); close() }
-                    drawPath(pathTop, colorYellow)
+                    drawPath(pathTop, getPlayerColor(2, engine.state.playerColors))
                     
                     val pathRight = Path().apply { moveTo(9 * cxPx, 6 * cxPx); lineTo(9 * cxPx, 9 * cxPx); lineTo(centerX, centerY); close() }
-                    drawPath(pathRight, colorBlue)
+                    drawPath(pathRight, getPlayerColor(3, engine.state.playerColors))
                     
                     val pathBottom = Path().apply { moveTo(6 * cxPx, 9 * cxPx); lineTo(9 * cxPx, 9 * cxPx); lineTo(centerX, centerY); close() }
-                    drawPath(pathBottom, colorRed)
+                    drawPath(pathBottom, getPlayerColor(0, engine.state.playerColors))
                     
                     val pathLeft = Path().apply { moveTo(6 * cxPx, 6 * cxPx); lineTo(6 * cxPx, 9 * cxPx); lineTo(centerX, centerY); close() }
-                    drawPath(pathLeft, colorGreen)
+                    drawPath(pathLeft, getPlayerColor(1, engine.state.playerColors))
                 }
 
                 // Draw tokens
@@ -1389,7 +1443,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                 shadowElevation = if ((animX.value - targetX.value) > 1f || (animY.value - targetY.value) > 1f || isMyTurnToken) 24f else 8f
                                 shape = CircleShape
                             }
-                            .background(getPlayerColor(token.player), CircleShape)
+                            .background(getPlayerColor(token.player, engine.state.playerColors), CircleShape)
                             .border(1.dp, Color.Black.copy(alpha = 0.6f), CircleShape)
                             .clickable { 
                                 engine.moveToken(token.id, token.player) { action -> scope.launch { action() } } 
@@ -1398,7 +1452,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                         if (token.rivalPlayer != -1) {
                             Box(modifier = Modifier
                                 .fillMaxSize()
-                                .border(5.dp, getPlayerColor(token.rivalPlayer).copy(alpha = 0.4f), CircleShape)
+                                .border(5.dp, getPlayerColor(token.rivalPlayer, engine.state.playerColors).copy(alpha = 0.4f), CircleShape)
                             )
                         }
                         if (isMyTurnToken) {
@@ -1515,10 +1569,10 @@ fun LudoApp(modifier: Modifier = Modifier) {
             // Bottom UI: Red and Blue
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(0, "Red", engine.state.currentPlayer == 0, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
+                    PlayerPanel(0, engine.playerName(0), engine.state.currentPlayer == 0, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, getPlayerColor(0, engine.state.playerColors), triggerRoll)
                 }
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(3, "Blue", engine.state.currentPlayer == 3, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
+                    PlayerPanel(3, engine.playerName(3), engine.state.currentPlayer == 3, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, getPlayerColor(3, engine.state.playerColors), triggerRoll)
                 }
             }
             
@@ -1577,7 +1631,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
 
 
         if (showVictoryScreen && winningPlayerIndex != -1) {
-            VictoryScreen(winnerIndex = winningPlayerIndex) {
+            VictoryScreen(winnerIndex = winningPlayerIndex, playerColors = engine.state.playerColors) {
                 showVictoryScreen = false
             }
         }
@@ -1621,7 +1675,7 @@ data class Particle(
     var rotationSpeed: Float
 )
 
-fun getPlayerName(index: Int) = when(index) {
+fun getPlayerName(index: Int, colors: Map<Int, Int>) = when(colors[index] ?: index) {
     0 -> "Red"
     1 -> "Green"
     2 -> "Yellow"
@@ -1630,9 +1684,9 @@ fun getPlayerName(index: Int) = when(index) {
 }
 
 @Composable
-fun VictoryScreen(winnerIndex: Int, onDismiss: () -> Unit) {
-    val winningPlayerName = getPlayerName(winnerIndex)
-    val color = getPlayerColor(winnerIndex)
+fun VictoryScreen(winnerIndex: Int, playerColors: Map<Int, Int>, onDismiss: () -> Unit) {
+    val winningPlayerName = getPlayerName(winnerIndex, playerColors)
+    val color = getPlayerColor(winnerIndex, playerColors)
     
     val scale = remember { androidx.compose.animation.core.Animatable(0f) }
     LaunchedEffect(Unit) {
