@@ -97,7 +97,8 @@ data class GameState(
         2 to PlayerMode.HUMAN,
         3 to PlayerMode.HUMAN
     ),
-    val gameMode: GameMode = GameMode.CLASSIC
+    val gameMode: GameMode = GameMode.CLASSIC,
+    val rocketBoostToken: Pair<Int, Int>? = null
 )
 
 // Board maps
@@ -440,7 +441,23 @@ class GameEngine(
             val currentTrailPath = mutableListOf<Int>()
             val trailStartTime = System.currentTimeMillis()
             
+            var willKill = false
+            if (pathSteps.isNotEmpty() && pathSteps.last() in 0..50) {
+                val endGlobalPos = (playerIndex * 13 + pathSteps.last()) % 52
+                if (!safeCells.contains(endGlobalPos)) {
+                    willKill = movedTokens.any {
+                        it.player != playerIndex &&
+                        !(state.gameMode == GameMode.TEAM && it.player == (playerIndex + 2) % 4) &&
+                        it.steps in 0..50 && ((it.player * 13 + it.steps) % 52) == endGlobalPos
+                    }
+                }
+            }
+            if (willKill) {
+                state = state.copy(rocketBoostToken = Pair(playerIndex, tokenId))
+            }
+            
             for (step in pathSteps) {
+
                 actualFinalSteps = step
                 
                 movedTokens[index] = movedTokens[index].copy(steps = step)
@@ -474,6 +491,8 @@ class GameEngine(
                     }
                 }
             }
+
+            state = state.copy(rocketBoostToken = null)
 
             if (killedOpponent) {
                 // 1. Trigger zoom and sound
@@ -661,25 +680,38 @@ fun PlayerPanel(
         label = "diceAlpha"
     )
 
-    val diceRotation = remember { androidx.compose.animation.core.Animatable(0f) }
+    val diceRotationZ = remember { androidx.compose.animation.core.Animatable(0f) }
+    val diceRotationX = remember { androidx.compose.animation.core.Animatable(0f) }
+    val diceRotationY = remember { androidx.compose.animation.core.Animatable(0f) }
     var isRolling by remember { mutableStateOf(false) }
     var visualValue by remember { mutableStateOf(1) }
 
     LaunchedEffect(rollTrigger) {
         if (rollTrigger > 0 && isActive) {
             isRolling = true
-            diceRotation.snapTo(0f)
+            diceRotationZ.snapTo(0f)
+            diceRotationX.snapTo(0f)
+            diceRotationY.snapTo(0f)
             launch {
-                diceRotation.animateTo(
-                    targetValue = 360f * 3f, // 3 full spins
-                    animationSpec = androidx.compose.animation.core.tween(
-                        durationMillis = 250,
-                        easing = androidx.compose.animation.core.FastOutSlowInEasing
-                    )
+                diceRotationZ.animateTo(
+                    targetValue = 360f * 2f,
+                    animationSpec = androidx.compose.animation.core.tween(durationMillis = 350, easing = androidx.compose.animation.core.FastOutSlowInEasing)
                 )
             }
             launch {
-                val endTime = System.currentTimeMillis() + 250
+                diceRotationX.animateTo(
+                    targetValue = 360f * 3f,
+                    animationSpec = androidx.compose.animation.core.tween(durationMillis = 350, easing = androidx.compose.animation.core.FastOutSlowInEasing)
+                )
+            }
+            launch {
+                diceRotationY.animateTo(
+                    targetValue = 360f * 1.5f,
+                    animationSpec = androidx.compose.animation.core.tween(durationMillis = 350, easing = androidx.compose.animation.core.FastOutSlowInEasing)
+                )
+            }
+            launch {
+                val endTime = System.currentTimeMillis() + 350
                 while (System.currentTimeMillis() < endTime && isRolling) {
                     visualValue = kotlin.random.Random.nextInt(1, 7)
                     kotlinx.coroutines.delay(40)
@@ -737,7 +769,9 @@ fun PlayerPanel(
                 .size(45.dp)
                 .graphicsLayer { 
                     this.alpha = diceAlpha
-                    this.rotationZ = diceRotation.value
+                    this.rotationZ = diceRotationZ.value
+                    this.rotationX = diceRotationX.value
+                    this.rotationY = diceRotationY.value
                     if (diceAlpha > 0f) shadowElevation = 8f
                     shape = RoundedCornerShape(12.dp) 
                 }
@@ -982,6 +1016,8 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     colors = ButtonDefaults.buttonColors(containerColor = colorGreen),
                     shape = RoundedCornerShape(16.dp)
                 ) { Text("START MATCH", fontSize = 22.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp) }
+                
+                Spacer(modifier = Modifier.height(48.dp))
             }
         }
         return
@@ -1005,10 +1041,9 @@ fun LudoApp(modifier: Modifier = Modifier) {
     ) {
         Column(
             modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
+                .fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Top
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
             // Top UI: Green and Yellow
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -1106,6 +1141,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
 
             BoxWithConstraints(
                 modifier = Modifier
+                    .weight(1f, fill = false)
                     .fillMaxWidth(0.95f)
                     .aspectRatio(1f)
                     .graphicsLayer {
@@ -1298,6 +1334,13 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     val animX by animateDpAsState(targetValue = targetX, animationSpec = tween(200, easing = LinearOutSlowInEasing))
                     val animY by animateDpAsState(targetValue = targetY, animationSpec = tween(200, easing = LinearOutSlowInEasing))
                     
+                    val moveHopScale = remember { Animatable(1f) }
+                    LaunchedEffect(targetX, targetY) {
+                        launch {
+                            moveHopScale.animateTo(1.3f, tween(100, easing = FastOutSlowInEasing))
+                            moveHopScale.animateTo(1f, tween(100, easing = FastOutSlowInEasing))
+                        }
+                    }
                     
                     val isMyTurnToken = engine.state.currentPlayer == token.player && engine.state.hasRolled && engine.isValidMove(token, currentDiceValue)
                     
@@ -1341,9 +1384,9 @@ fun LudoApp(modifier: Modifier = Modifier) {
                         Box(modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
-                                scaleX = scale
-                                scaleY = scale
-                                shadowElevation = if (animX != targetX || animY != targetY || isMyTurnToken) 24f else 8f
+                                scaleX = scale * moveHopScale.value
+                                scaleY = scale * moveHopScale.value
+                                shadowElevation = if ((animX.value - targetX.value) > 1f || (animY.value - targetY.value) > 1f || isMyTurnToken) 24f else 8f
                                 shape = CircleShape
                             }
                             .background(getPlayerColor(token.player), CircleShape)
@@ -1366,6 +1409,31 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                 .border(3.dp, Brush.sweepGradient(listOf(Color(0xFFFFD700), Color(0xFFFFF8DC), Color(0xFFFFD700))), CircleShape)
                             )
                         }
+                        
+                        val isRocketBoost = engine.state.rocketBoostToken?.first == token.player && engine.state.rocketBoostToken?.second == token.id
+                        if (isRocketBoost) {
+                            val rocketFireScale by infiniteTransition.animateFloat(
+                                initialValue = 1f, targetValue = 1.4f,
+                                animationSpec = infiniteRepeatable(tween(80), RepeatMode.Reverse),
+                                label = "rocketScale"
+                            )
+                            val rocketFireAlpha by infiniteTransition.animateFloat(
+                                initialValue = 0.6f, targetValue = 1f,
+                                animationSpec = infiniteRepeatable(tween(80), RepeatMode.Reverse),
+                                label = "rocketAlpha"
+                            )
+                            Box(modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer { 
+                                    scaleX = rocketFireScale
+                                    scaleY = rocketFireScale
+                                    alpha = rocketFireAlpha
+                                }
+                                .border(4.dp, Color(0xFF00E5FF), CircleShape)
+                                .border(8.dp, Color(0xFF2962FF).copy(alpha = 0.6f), CircleShape)
+                            )
+                        }
+                        
                         // Glossy plastic effect base gradient
                         Box(modifier = Modifier
                             .fillMaxSize()
