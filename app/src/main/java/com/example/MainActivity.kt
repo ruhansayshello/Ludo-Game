@@ -971,6 +971,10 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                             newColors[2] = newColors[0] ?: 0
                                             newColors[3] = newColors[1] ?: 1
                                             menuColors = newColors
+                                            val newModes = menuModes.toMutableMap()
+                                            if (newModes[2] == PlayerMode.INACTIVE) newModes[2] = PlayerMode.COMPUTER
+                                            if (newModes[3] == PlayerMode.INACTIVE) newModes[3] = PlayerMode.COMPUTER
+                                            menuModes = newModes
                                         }
                                     },
                                     enabled = enabled,
@@ -1013,6 +1017,11 @@ fun LudoApp(modifier: Modifier = Modifier) {
                         
                         listOf(0, 1, 2, 3).forEach { pIdx ->
                             if (activeIndices.contains(pIdx)) {
+                                if (menuModes[pIdx] == PlayerMode.INACTIVE) {
+                                    val newModes = menuModes.toMutableMap()
+                                    newModes[pIdx] = PlayerMode.COMPUTER
+                                    menuModes = newModes
+                                }
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically, 
                                     horizontalArrangement = Arrangement.SpaceBetween,
