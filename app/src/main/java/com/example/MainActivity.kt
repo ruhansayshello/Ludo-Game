@@ -11,8 +11,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -156,7 +158,7 @@ fun tokenPos(token: TokenState): Pair<Float, Float> {
 
 class SoundManager(context: android.content.Context) {
 
-    private fun playBeep(freq: Double, durationMs: Int) {
+    private fun playSynth(freqStart: Double, freqEnd: Double, durationMs: Int, waveType: String = "sine") {
         Thread {
             try {
                 val sampleRate = 44100
@@ -165,8 +167,22 @@ class SoundManager(context: android.content.Context) {
                 val generatedSnd = ByteArray(2 * numSamples)
                 
                 for (i in 0 until numSamples) {
-                    sample[i] = kotlin.math.sin(2.0 * Math.PI * i / (sampleRate / freq))
+                    val progress = i.toDouble() / numSamples
+                    val freq = freqStart + (freqEnd - freqStart) * progress
+                    val time = i.toDouble() / sampleRate
+                    
+                    var wave = 0.0
+                    when (waveType) {
+                        "sine" -> wave = kotlin.math.sin(2.0 * Math.PI * freq * time)
+                        "square" -> wave = if (kotlin.math.sin(2.0 * Math.PI * freq * time) > 0) 1.0 else -1.0
+                        "noise" -> wave = java.lang.Math.random() * 2.0 - 1.0
+                    }
+                    
+                    // Exponential decay envelope
+                    val envelope = kotlin.math.exp(-progress * 5.0)
+                    sample[i] = wave * envelope
                 }
+                
                 var idx = 0
                 for (dVal in sample) {
                     val valShort = (dVal * 32767).toInt().toShort()
@@ -191,28 +207,33 @@ class SoundManager(context: android.content.Context) {
     }
 
     fun playDiceRoll() {
-        playBeep(440.0, 100)
-        playBeep(660.0, 100)
+        playSynth(800.0, 200.0, 150, "noise")
+        Thread.sleep(100)
+        playSynth(600.0, 100.0, 150, "noise")
     }
 
     fun playTokenHop() {
-        playBeep(880.0, 80)
+        playSynth(400.0, 800.0, 100, "sine")
     }
 
     fun playKillStrike() {
-        playBeep(220.0, 300)
-        playBeep(110.0, 400)
+        playSynth(150.0, 50.0, 300, "square")
     }
     
     fun playWinSequence() {
-        playBeep(523.25, 200) // C5
-        playBeep(659.25, 200) // E5
-        playBeep(783.99, 200) // G5
-        playBeep(1046.50, 400) // C6
+        Thread {
+            playSynth(523.25, 523.25, 200, "sine") // C5
+            Thread.sleep(200)
+            playSynth(659.25, 659.25, 200, "sine") // E5
+            Thread.sleep(200)
+            playSynth(783.99, 783.99, 200, "sine") // G5
+            Thread.sleep(200)
+            playSynth(1046.50, 1046.50, 400, "sine") // C6
+        }.start()
     }
 
     fun playButtonClick() {
-        playBeep(1200.0, 50)
+        playSynth(1200.0, 1200.0, 50, "sine")
     }
 
     fun release() {
@@ -824,8 +845,11 @@ fun LudoApp(modifier: Modifier = Modifier) {
     if (screenState == ScreenState.MENU) {
         Box(modifier = modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFFE8EAF6), Color(0xFFC5CAE9))))) {
             Column(
-                modifier = Modifier.fillMaxSize().padding(32.dp),
-                verticalArrangement = Arrangement.Center,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 48.dp, horizontal = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
@@ -833,11 +857,11 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     style = MaterialTheme.typography.displayLarge.copy(fontSize = 64.sp),
                     color = colorRed,
                     fontWeight = FontWeight.Black,
-                    modifier = Modifier.padding(bottom = 32.dp)
+                    modifier = Modifier.padding(bottom = 8.dp)
                 )
                 
                 Card(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(24.dp),
                     colors = CardDefaults.cardColors(containerColor = Color.White),
                     elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
@@ -862,7 +886,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 }
 
                 Card(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(24.dp),
                     colors = CardDefaults.cardColors(containerColor = Color.White),
                     elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
@@ -909,7 +933,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 }
                 
                 Card(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 32.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(24.dp),
                     colors = CardDefaults.cardColors(containerColor = Color.White),
                     elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
@@ -933,6 +957,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                     val currentMode = menuModes[pIdx] ?: PlayerMode.HUMAN
                                     OutlinedButton(
                                         onClick = {
+                                            soundManager.playButtonClick()
                                             menuModes = menuModes.toMutableMap().apply { this[pIdx] = if (currentMode == PlayerMode.HUMAN) PlayerMode.COMPUTER else PlayerMode.HUMAN }
                                         },
                                         colors = ButtonDefaults.outlinedButtonColors(containerColor = if (currentMode == PlayerMode.COMPUTER) Color(0xFFF3E5F5) else Color.Transparent),
@@ -949,6 +974,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                 
                 Button(
                     onClick = {
+                        soundManager.playButtonClick()
                         engine.initGame(menuModes, menuGameMode)
                         screenState = ScreenState.PLAYING
                     },
@@ -978,9 +1004,11 @@ fun LudoApp(modifier: Modifier = Modifier) {
             }
     ) {
         Column(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween
+            verticalArrangement = Arrangement.Top
         ) {
             // Top UI: Green and Yellow
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
