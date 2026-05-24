@@ -17,8 +17,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.draw.scale
@@ -55,11 +57,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+enum class PlayerMode { HUMAN, COMPUTER, INACTIVE }
+enum class ScreenState { MENU, PLAYING }
+
 // Data structures
 data class TokenState(
     val id: Int,
     val player: Int, // 0: Red, 1: Green, 2: Yellow, 3: Blue
-    val steps: Int = -1 // -1 is Base, 0..50 is Path, 51..55 is Home Stretch, 56 is Home
+    val steps: Int = -1, // -1 is Base, 0..50 is Path, 51..55 is Home Stretch, 56 is Home
+    val rivalPlayer: Int = -1
 )
 
 data class GameState(
@@ -71,7 +77,14 @@ data class GameState(
     val winOrder: List<Int> = emptyList(),
     val lastKillTimestamp: Long = 0L,
     val killEventTimestamp: Long = 0L,
-    val lastKillPos: Int = -1
+    val lastKillPos: Int = -1,
+    val isRevengeEvent: Boolean = false,
+    val playerModes: Map<Int, PlayerMode> = mapOf(
+        0 to PlayerMode.HUMAN,
+        1 to PlayerMode.HUMAN,
+        2 to PlayerMode.HUMAN,
+        3 to PlayerMode.HUMAN
+    )
 )
 
 // Board maps
@@ -130,42 +143,171 @@ fun tokenPos(token: TokenState): Pair<Float, Float> {
     }
 }
 
-class GameEngine {
+class SoundManager(context: android.content.Context) {
+    private var soundPool: android.media.SoundPool? = null
+    
+    private var diceRollId = 0
+    private var tokenHopId = 0
+    private var killStrikeId = 0
+    private var winSequenceId = 0
+
+    init {
+        val audioAttributes = android.media.AudioAttributes.Builder()
+            .setUsage(android.media.AudioAttributes.USAGE_GAME)
+            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+            
+        soundPool = android.media.SoundPool.Builder()
+            .setMaxStreams(5)
+            .setAudioAttributes(audioAttributes)
+            .build()
+
+        fun loadSound(name: String): Int {
+            val resId = context.resources.getIdentifier(name, "raw", context.packageName)
+            // If the raw file string matches something in resources it will load, otherwise silently return 0.
+            return if (resId != 0) soundPool?.load(context, resId, 1) ?: 0 else 0
+        }
+        
+        diceRollId = loadSound("dice_roll")
+        tokenHopId = loadSound("token_hop")
+        killStrikeId = loadSound("kill_strike")
+        winSequenceId = loadSound("win_sequence")
+    }
+
+    fun playDiceRoll() {
+        if (diceRollId != 0) soundPool?.play(diceRollId, 1f, 1f, 0, 0, 1f)
+    }
+
+    fun playTokenHop() {
+        if (tokenHopId != 0) soundPool?.play(tokenHopId, 1f, 1f, 0, 0, 1f)
+    }
+
+    fun playKillStrike() {
+        if (killStrikeId != 0) soundPool?.play(killStrikeId, 1f, 1f, 0, 0, 1f)
+    }
+    
+    fun playWinSequence() {
+        if (winSequenceId != 0) soundPool?.play(winSequenceId, 1f, 1f, 0, 0, 1f)
+    }
+
+    fun release() {
+        soundPool?.release()
+        soundPool = null
+    }
+}
+
+class GameEngine(
+    private val playSound: (String) -> Unit = {},
+    var onRequestRoll: () -> Unit = {}
+) {
     var state by mutableStateOf(GameState())
         private set
+
+    fun initGame(modes: Map<Int, PlayerMode>) {
+        val initialTokens = modes.filter { it.value != PlayerMode.INACTIVE }
+            .keys.flatMap { p -> (0..3).map { t -> TokenState(t, p) } }
+            
+        val firstPlayer = modes.entries.firstOrNull { it.value != PlayerMode.INACTIVE }?.key ?: 0
+        state = GameState(
+            tokens = initialTokens,
+            currentPlayer = firstPlayer,
+            message = "${playerName(firstPlayer)}'s turn. Roll the dice!",
+            playerModes = modes
+        )
+    }
 
     fun processRoll(roll: Int, onDelay: (suspend () -> Unit) -> Unit) {
         if (state.hasRolled || state.winOrder.size >= 3) return
         
-        val validMoves = getValidMoves(state.currentPlayer, roll)
+        state = state.copy(
+            diceValue = roll,
+            hasRolled = true
+        )
+        
+        checkAutoPlayCondition(onDelay)
+    }
+
+    fun checkAutoPlayCondition(onDelay: (suspend () -> Unit) -> Unit) {
+        val validMoves = getValidMoves(state.currentPlayer, state.diceValue)
+        val isAI = state.playerModes[state.currentPlayer] == PlayerMode.COMPUTER
         
         if (validMoves.isEmpty()) {
             state = state.copy(
-                diceValue = roll,
-                hasRolled = true,
-                message = "${playerName(state.currentPlayer)} rolled $roll. No valid moves."
+                message = "${playerName(state.currentPlayer)} rolled ${state.diceValue}. No valid moves."
             )
             onDelay {
                 kotlinx.coroutines.delay(1000)
                 nextPlayer()
+                triggerAIIfNecessary(onDelay)
+            }
+        } else if (isAI) {
+            val bestMove = decideBestMoveForAI(validMoves)
+            onDelay {
+                kotlinx.coroutines.delay(400) // Small pause so we can see the AI think
+                moveToken(bestMove.id, bestMove.player, onDelay)
             }
         } else if (validMoves.size == 1) {
             state = state.copy(
-                diceValue = roll,
-                hasRolled = true,
-                message = "${playerName(state.currentPlayer)} rolled $roll. Auto-moving token."
+                message = "${playerName(state.currentPlayer)} rolled ${state.diceValue}. Auto-moving token."
             )
             onDelay {
-                kotlinx.coroutines.delay(800)
                 moveToken(validMoves[0].id, validMoves[0].player, onDelay)
             }
         } else {
             state = state.copy(
-                diceValue = roll,
-                hasRolled = true,
-                message = "${playerName(state.currentPlayer)} rolled $roll. Select a token to move."
+                message = "${playerName(state.currentPlayer)} rolled ${state.diceValue}. Select a token to move."
             )
         }
+    }
+
+    fun getBestMove(): TokenState? {
+        val validMoves = state.tokens.filter { it.player == state.currentPlayer && isValidMove(it, state.diceValue) }
+        return if (validMoves.isNotEmpty()) decideBestMoveForAI(validMoves) else null
+    }
+
+    private fun decideBestMoveForAI(validMoves: List<TokenState>): TokenState {
+        val roll = state.diceValue
+        
+        // 1. Spawning priority
+        if (roll == 6) {
+            val baseToken = validMoves.find { it.steps == -1 }
+            if (baseToken != null) return baseToken
+        }
+
+        // 2. Kill priority
+        for (token in validMoves) {
+            if (token.steps != -1 && token.steps + roll <= 50) {
+                val globalPos = (token.player * 13 + token.steps + roll) % 52
+                if (!safeCells.contains(globalPos)) {
+                    val killable = state.tokens.any {
+                        it.player != token.player && it.steps in 0..50 && ((it.player * 13 + it.steps) % 52) == globalPos
+                    }
+                    if (killable) return token
+                }
+            }
+        }
+
+        // 3. Avoid danger (if a move lands on unsafe tile with enemy behind, avoid if possible)
+        val safeMoves = validMoves.filter { it.steps == -1 || isSafeLading(it, roll) }
+        val pool = if (safeMoves.isNotEmpty()) safeMoves else validMoves
+
+        // 4. Furthest advanced
+        return pool.maxByOrNull { it.steps } ?: validMoves.first()
+    }
+
+    private fun isSafeLading(token: TokenState, roll: Int): Boolean {
+        if (token.steps + roll > 50) return true // Home stretch is safe
+        val globalPos = (token.player * 13 + token.steps + roll) % 52
+        if (safeCells.contains(globalPos)) return true
+        
+        // Check if any enemy is 1..6 steps behind
+        val enemies = state.tokens.filter { it.player != token.player && it.steps in 0..50 }
+        for (e in enemies) {
+            val eGlobal = (e.player * 13 + e.steps) % 52
+            val dist = (globalPos - eGlobal + 52) % 52
+            if (dist in 1..6) return false
+        }
+        return true
     }
 
     private fun getValidMoves(playerIndex: Int, roll: Int): List<TokenState> {
@@ -198,47 +340,62 @@ class GameEngine {
             }
         }
         
-        val finalSteps = if (originalSteps == -1) 0 else originalSteps + diceVal
-
         launch {
             val movedTokens = state.tokens.toMutableList()
             val index = movedTokens.indexOfFirst { it.id == tokenId && it.player == playerIndex }
-            movedTokens[index] = movedTokens[index].copy(steps = finalSteps)
 
             var killedOpponent = false
             var killGlobalPos = -1
+            var actualFinalSteps = originalSteps
             val opponentsToKill = mutableListOf<TokenState>()
             
-            if (finalSteps in 0..50) {
-                val globalPos = (playerIndex * 13 + finalSteps) % 52
-                if (!safeCells.contains(globalPos)) {
-                    val opponentsHere = movedTokens.filter {
-                        it.player != playerIndex &&
-                        it.steps in 0..50 &&
-                        ((it.player * 13 + it.steps) % 52) == globalPos
-                    }
-                    if (opponentsHere.isNotEmpty()) {
-                        opponentsToKill.addAll(opponentsHere)
-                        killedOpponent = true
-                        killGlobalPos = globalPos
+            for (step in pathSteps) {
+                actualFinalSteps = step
+                
+                movedTokens[index] = movedTokens[index].copy(steps = step)
+                state = state.copy(tokens = movedTokens)
+                playSound("token_hop")
+                
+                if (step != pathSteps.last()) {
+                    kotlinx.coroutines.delay(200) // Hop pause
+                }
+
+                if (step in 0..50) {
+                    val globalPos = (playerIndex * 13 + step) % 52
+                    if (!safeCells.contains(globalPos)) {
+                        val opponentsHere = movedTokens.filter {
+                            it.player != playerIndex &&
+                            it.steps in 0..50 &&
+                            ((it.player * 13 + it.steps) % 52) == globalPos
+                        }
+                        if (opponentsHere.isNotEmpty()) {
+                            opponentsToKill.add(opponentsHere.first())
+                            killedOpponent = true
+                            killGlobalPos = globalPos
+                            break
+                        }
                     }
                 }
             }
 
             if (killedOpponent) {
-                // 1. Move attacker
-                state = state.copy(tokens = movedTokens)
+                // 1. Trigger zoom and sound
+                playSound("kill_strike")
                 
-                // 2. Wait for attacker to arrive at the cell
-                kotlinx.coroutines.delay(400)
+                var isRevenge = false
+                opponentsToKill.forEach { opp ->
+                    if (opp.rivalPlayer == state.currentPlayer) {
+                        isRevenge = true
+                    }
+                }
                 
-                // 3. Trigger zoom
                 state = state.copy(
                     lastKillTimestamp = System.currentTimeMillis(),
-                    lastKillPos = killGlobalPos
+                    lastKillPos = killGlobalPos,
+                    isRevengeEvent = isRevenge
                 )
                 
-                // 4. Wait for zoom peak (cinematic scale takes its time)
+                // 2. Wait for zoom peak (cinematic scale takes its time)
                 kotlinx.coroutines.delay(800)
                 
                 // 5. Remove victims and trigger ring
@@ -246,9 +403,12 @@ class GameEngine {
                 opponentsToKill.forEach { opp ->
                     val oppIndex = killedTokens.indexOfFirst { it.id == opp.id && it.player == opp.player }
                     if (oppIndex != -1) {
-                         killedTokens[oppIndex] = killedTokens[oppIndex].copy(steps = -1)
+                         killedTokens[oppIndex] = killedTokens[oppIndex].copy(steps = -1, rivalPlayer = -1)
                     }
                 }
+                // Mark the killer as a rival (owned by the victim's player for the revenge logic)
+                killedTokens[index] = killedTokens[index].copy(rivalPlayer = opponentsToKill.first().player)
+                
                 state = state.copy(tokens = killedTokens, killEventTimestamp = System.currentTimeMillis())
                 
                 // 6. Wait to show the effect before zoom out begins
@@ -257,7 +417,7 @@ class GameEngine {
                 state = state.copy(tokens = movedTokens)
             }
 
-            val hasExtraTurn = state.diceValue == 6 || killedOpponent || finalSteps == 56
+            val hasExtraTurn = state.diceValue == 6 || killedOpponent || actualFinalSteps == 56
 
             val winOrder = state.winOrder.toMutableList()
             val finalTokens = state.tokens
@@ -275,15 +435,18 @@ class GameEngine {
                      hasRolled = false,
                      message = "Extra turn! Roll again."
                  )
+                 triggerAIIfNecessary(launch)
             } else {
                  nextPlayer()
+                 triggerAIIfNecessary(launch)
             }
         }
     }
 
     private fun nextPlayer() {
         var next = (state.currentPlayer + 1) % 4
-        while (state.winOrder.contains(next) && state.winOrder.size < 3) {
+        val activePlayers = state.playerModes.count { it.value != PlayerMode.INACTIVE }
+        while ((state.winOrder.contains(next) || state.playerModes[next] == PlayerMode.INACTIVE) && state.winOrder.size < activePlayers - 1) {
             next = (next + 1) % 4
         }
         state = state.copy(
@@ -291,6 +454,18 @@ class GameEngine {
             hasRolled = false,
             message = "${playerName(next)}'s turn. Roll the dice!"
         )
+    }
+
+    fun triggerAIIfNecessary(onDelay: (suspend () -> Unit) -> Unit) {
+        val activePlayers = state.playerModes.count { it.value != PlayerMode.INACTIVE }
+        if (state.winOrder.size >= activePlayers - 1) return
+        
+        if (state.playerModes[state.currentPlayer] == PlayerMode.COMPUTER && !state.hasRolled) {
+            onDelay {
+                kotlinx.coroutines.delay(800)
+                onRequestRoll()
+            }
+        }
     }
 
     fun playerName(index: Int) = when(index) {
@@ -353,12 +528,51 @@ fun PlayerPanel(
     name: String,
     isActive: Boolean,
     diceValue: Int,
-    isRolling: Boolean,
+    diceVisible: Boolean,
+    rollTrigger: Int,
+    timeRemainingMs: Long,
     onRoll: (Offset, Int?) -> Unit
 ) {
     val color = getPlayerColor(playerIdx)
     val alpha by animateFloatAsState(if (isActive) 1f else 0.4f)
     val scale by animateFloatAsState(if (isActive) 1.05f else 1f)
+    
+    val diceAlpha by animateFloatAsState(
+        targetValue = if (isActive) 1f else 0.4f,
+        animationSpec = androidx.compose.animation.core.tween(150),
+        label = "diceAlpha"
+    )
+
+    val diceRotation = remember { androidx.compose.animation.core.Animatable(0f) }
+    var isRolling by remember { mutableStateOf(false) }
+    var visualValue by remember { mutableStateOf(1) }
+
+    LaunchedEffect(rollTrigger) {
+        if (rollTrigger > 0 && isActive) {
+            isRolling = true
+            diceRotation.snapTo(0f)
+            launch {
+                diceRotation.animateTo(
+                    targetValue = 360f * 3f, // 3 full spins
+                    animationSpec = androidx.compose.animation.core.tween(
+                        durationMillis = 250,
+                        easing = androidx.compose.animation.core.FastOutSlowInEasing
+                    )
+                )
+            }
+            launch {
+                val endTime = System.currentTimeMillis() + 250
+                while (System.currentTimeMillis() < endTime && isRolling) {
+                    visualValue = kotlin.random.Random.nextInt(1, 7)
+                    kotlinx.coroutines.delay(40)
+                }
+                visualValue = diceValue
+                isRolling = false
+            }
+        } else if (!isRolling) {
+            visualValue = diceValue
+        }
+    }
 
     Row(
         modifier = Modifier
@@ -370,135 +584,241 @@ fun PlayerPanel(
             }
             .background(Color.White, RoundedCornerShape(12.dp))
             .border(2.dp, color, RoundedCornerShape(12.dp))
+            .clickable(enabled = isActive) { onRoll(Offset(0f, -10f), null) }
             .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Avatar
+        val timerProgress = timeRemainingMs / 10000f
         Box(
-            modifier = Modifier.size(40.dp).background(color, CircleShape),
+            modifier = Modifier.size(40.dp),
             contentAlignment = Alignment.Center
         ) {
-            Text(name.take(1), color = Color.White, fontWeight = FontWeight.Bold)
+            if (isActive && timeRemainingMs > 0) {
+                androidx.compose.material3.CircularProgressIndicator(
+                     progress = { timerProgress },
+                     modifier = Modifier.fillMaxSize(),
+                     color = color,
+                     strokeWidth = 3.dp,
+                     trackColor = Color.LightGray.copy(alpha = 0.5f)
+                )
+            }
+            Box(
+                modifier = Modifier.size(32.dp).background(color, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(name.take(1), color = Color.White, fontWeight = FontWeight.Bold)
+            }
         }
         Spacer(modifier = Modifier.width(8.dp))
         Text(name, fontWeight = FontWeight.Bold, color = color, modifier = Modifier.weight(1f))
         
         Spacer(modifier = Modifier.width(8.dp))
-        if (isActive) {
-            Box(
-                modifier = Modifier
-                    .size(45.dp)
-                    .clickable { onRoll(Offset(0f, -10f), null) }
-                    .graphicsLayer { shadowElevation = 8f; shape = RoundedCornerShape(12.dp) }
-                    .background(color, RoundedCornerShape(12.dp))
-                    .border(2.dp, Color.White, RoundedCornerShape(12.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                DiceDots(if(isRolling) 0 else diceValue)
-            }
-        } else {
-            Box(modifier = Modifier.size(45.dp)) // Placeholder to maintain size
+        Box(
+            modifier = Modifier
+                .size(45.dp)
+                .graphicsLayer { 
+                    this.alpha = diceAlpha
+                    this.rotationZ = diceRotation.value
+                    if (diceAlpha > 0f) shadowElevation = 8f
+                    shape = RoundedCornerShape(12.dp) 
+                }
+                .background(color, RoundedCornerShape(12.dp))
+                .border(2.dp, Color.White, RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            DiceDots(visualValue)
         }
     }
 }
 
+
+
 @Composable
 fun LudoApp(modifier: Modifier = Modifier) {
-    val engine = remember { GameEngine() }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val soundManager = remember { com.example.SoundManager(context) }
+    
+    DisposableEffect(Unit) {
+        onDispose {
+            soundManager.release()
+        }
+    }
+    
+    val engine = remember(soundManager) { 
+        GameEngine(playSound = { event -> 
+            when (event) {
+                "dice_roll" -> soundManager.playDiceRoll()
+                "token_hop" -> soundManager.playTokenHop()
+                "kill_strike" -> soundManager.playKillStrike()
+                "win_sequence" -> soundManager.playWinSequence()
+            }
+        })
+    }
+    
     val scope = rememberCoroutineScope()
     
     var diceVisible by remember { mutableStateOf(false) }
-    var diceValue by remember { mutableStateOf(1) }
-    var diceColor by remember { mutableStateOf(Color.Red) }
-    val diceOffsetX = remember { Animatable(0f) }
-    val diceOffsetY = remember { Animatable(0f) }
-    val diceRotationX = remember { Animatable(0f) }
-    val diceRotationY = remember { Animatable(0f) }
-    val diceRotationZ = remember { Animatable(0f) }
-    val diceScale = remember { Animatable(1f) }
-    
-    var isRolling by remember { mutableStateOf(false) }
-    var showGoldenPulse by remember { mutableStateOf(false) }
+    var diceRollTrigger by remember { mutableStateOf(0) }
     var currentDiceValue by remember { mutableStateOf(1) }
 
+    // Smart Turn Timer
+    var turnRemainingMs by remember { mutableStateOf(10000L) }
+    
+    // Cinematic Zoom Animation
+    var cinematicScale by remember { mutableStateOf(1f) }
+    val animCinematicScale by animateFloatAsState(targetValue = cinematicScale, animationSpec = spring(dampingRatio = 0.5f, stiffness = 100f))
+    
+    var isRevengeBannerVisible by remember { mutableStateOf(false) }
+    val shakeOffsetX = remember { Animatable(0f) }
+    val shakeOffsetY = remember { Animatable(0f) }
+
+    var showVictoryScreen by remember { mutableStateOf(false) }
+    var winningPlayerIndex by remember { mutableStateOf(-1) }
+
+    var screenState by remember { mutableStateOf(ScreenState.MENU) }
+
+    var menuPlayerCount by remember { mutableStateOf(4) }
+    var menuModes by remember { mutableStateOf(mutableMapOf<Int, PlayerMode>(
+        0 to PlayerMode.HUMAN,
+        1 to PlayerMode.COMPUTER,
+        2 to PlayerMode.HUMAN,
+        3 to PlayerMode.COMPUTER
+    )) }
+
+    LaunchedEffect(engine.state.tokens, engine.state.currentPlayer) {
+        diceVisible = false
+    }
+
+    LaunchedEffect(engine.state.winOrder) {
+        if (engine.state.winOrder.isNotEmpty() && !showVictoryScreen) {
+            winningPlayerIndex = engine.state.winOrder.first()
+            showVictoryScreen = true
+            soundManager.playWinSequence()
+        }
+    }
+
     val triggerRoll: (Offset, Int?) -> Unit = { dir, forcedValue ->
-        if (!isRolling && !engine.state.hasRolled && engine.state.winOrder.size < 3) {
+        if (!engine.state.hasRolled && engine.state.winOrder.size < 3) {
             val rollResult = forcedValue ?: Random.nextInt(1, 7)
-            val pColor = getPlayerColor(engine.state.currentPlayer)
             
-            diceColor = pColor
-            isRolling = true
-            showGoldenPulse = false
-            diceValue = rollResult
+            soundManager.playDiceRoll()
+            currentDiceValue = rollResult
             diceVisible = true
+            diceRollTrigger++
 
             scope.launch {
-                val dist = sqrt(dir.x * dir.x + dir.y * dir.y)
-                val nx = if (dist > 10f) dir.x / dist else 0f
-                val ny = if (dist > 10f) dir.y / dist else -1f // default swipe up (throw from bottom)
-                
-                val launchDist = 1200f
-                val startTransX = -nx * launchDist
-                val startTransY = -ny * launchDist
-                
-                diceOffsetX.snapTo(startTransX)
-                diceOffsetY.snapTo(startTransY)
-                diceRotationX.snapTo(0f)
-                diceRotationY.snapTo(0f)
-                diceRotationZ.snapTo(0f)
-                diceScale.snapTo(2.0f)
-                
-                val endX = (Random.nextFloat() - 0.5f) * 200f
-                val endY = (Random.nextFloat() - 0.5f) * 200f
-                
-                val targetRots = when(rollResult) {
-                    1 -> Triple(0f, 0f, 0f)
-                    2 -> Triple(0f, -90f, 0f)
-                    5 -> Triple(0f, 90f, 0f)
-                    3 -> Triple(90f, 0f, 0f)
-                    4 -> Triple(-90f, 0f, 0f)
-                    6 -> Triple(180f, 0f, 0f)
-                    else -> Triple(0f, 0f, 0f)
-                }
-
-                val rotX = 360f * 4f + targetRots.first
-                val rotY = 360f * 3f + targetRots.second
-                val rotZ = 360f * 2f + targetRots.third + (Random.nextFloat() * 60f - 30f)
-
-                launch { diceOffsetX.animateTo(endX, animationSpec = spring(dampingRatio = 0.55f, stiffness = 60f)) }
-                launch { diceOffsetY.animateTo(endY, animationSpec = spring(dampingRatio = 0.55f, stiffness = 60f)) }
-                launch { diceRotationX.animateTo(rotX, animationSpec = tween(700, easing = FastOutSlowInEasing)) }
-                launch { diceRotationY.animateTo(rotY, animationSpec = tween(700, easing = FastOutSlowInEasing)) }
-                launch { diceRotationZ.animateTo(rotZ, animationSpec = tween(700, easing = FastOutSlowInEasing)) }
-                launch {
-                    diceScale.animateTo(1.3f, animationSpec = keyframes {
-                        durationMillis = 700
-                        2.0f at 0
-                        1.0f at 400
-                        1.4f at 550
-                        1.3f at 700
-                    })
-                }
-                
-                delay(750)
-                isRolling = false
-                currentDiceValue = rollResult
-                
-                // Show golden pulse for 0.7 seconds
-                showGoldenPulse = true
-                delay(700)
-                showGoldenPulse = false
-                
+                kotlinx.coroutines.delay(250)
                 engine.processRoll(rollResult) { action -> scope.launch { action() } }
-                
-                delay(600)
-                diceVisible = false
             }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        engine.onRequestRoll = {
+            triggerRoll(Offset.Zero, null)
         }
     }
 
     var dragStart by remember { mutableStateOf(Offset.Zero) }
     var dragEnd by remember { mutableStateOf(Offset.Zero) }
+
+    if (screenState == ScreenState.MENU) {
+        Box(modifier = modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFFE8EAF6), Color(0xFFC5CAE9))))) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "LUDO",
+                    style = MaterialTheme.typography.displayLarge.copy(fontSize = 64.sp),
+                    color = colorRed,
+                    fontWeight = FontWeight.Black,
+                    modifier = Modifier.padding(bottom = 32.dp)
+                )
+                
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("Active Players", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color.DarkGray)
+                        Row(modifier = Modifier.padding(top = 16.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                            listOf(2, 3, 4).forEach { count ->
+                                val isSelected = menuPlayerCount == count
+                                Button(
+                                    onClick = { menuPlayerCount = count },
+                                    modifier = Modifier.padding(horizontal = 8.dp).weight(1f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = if (isSelected) colorBlue else Color(0xFFEEEEEE), contentColor = if (isSelected) Color.White else Color.Black),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) { Text("$count", fontWeight = FontWeight.Bold, fontSize = 20.sp) }
+                            }
+                        }
+                    }
+                }
+                
+                // Map 2-player to index 0, 2; 3-player to 0, 1, 2; 4-player 0, 1, 2, 3.
+                val activeIndices = when (menuPlayerCount) {
+                    2 -> listOf(0, 2)
+                    3 -> listOf(0, 1, 2)
+                    else -> listOf(0, 1, 2, 3)
+                }
+                
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 32.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(24.dp).fillMaxWidth()) {
+                        Text("Player Control", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color.DarkGray, modifier = Modifier.padding(bottom = 16.dp).align(Alignment.CenterHorizontally))
+                        
+                        listOf(0, 1, 2, 3).forEach { pIdx ->
+                            if (activeIndices.contains(pIdx)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically, 
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(modifier = Modifier.size(16.dp).background(getPlayerColor(pIdx), CircleShape))
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Text(engine.playerName(pIdx), color = Color.DarkGray, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                    }
+                                    
+                                    val currentMode = menuModes[pIdx] ?: PlayerMode.HUMAN
+                                    OutlinedButton(
+                                        onClick = {
+                                            menuModes = menuModes.toMutableMap().apply { this[pIdx] = if (currentMode == PlayerMode.HUMAN) PlayerMode.COMPUTER else PlayerMode.HUMAN }
+                                        },
+                                        colors = ButtonDefaults.outlinedButtonColors(containerColor = if (currentMode == PlayerMode.COMPUTER) Color(0xFFF3E5F5) else Color.Transparent),
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, if (currentMode == PlayerMode.COMPUTER) Color(0xFF9C27B0) else Color.LightGray)
+                                    ) { Text(if (currentMode == PlayerMode.HUMAN) "👤 HUMAN" else "🤖 CPU", color = if (currentMode == PlayerMode.COMPUTER) Color(0xFF9C27B0) else Color.Gray, fontWeight = FontWeight.Bold) }
+                                }
+                            } else {
+                                menuModes[pIdx] = PlayerMode.INACTIVE
+                            }
+                        }
+                    }
+                }
+                
+                Button(
+                    onClick = {
+                        engine.initGame(menuModes)
+                        screenState = ScreenState.PLAYING
+                    },
+                    modifier = Modifier.fillMaxWidth().height(64.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = colorGreen),
+                    shape = RoundedCornerShape(16.dp)
+                ) { Text("START MATCH", fontSize = 22.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp) }
+            }
+        }
+        return
+    }
 
     Box(
         modifier = modifier
@@ -524,22 +844,49 @@ fun LudoApp(modifier: Modifier = Modifier) {
             // Top UI: Green and Yellow
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(1, "Green", engine.state.currentPlayer == 1, currentDiceValue, isRolling, triggerRoll)
+                    PlayerPanel(1, "Green", engine.state.currentPlayer == 1, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
                 }
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(2, "Yellow", engine.state.currentPlayer == 2, currentDiceValue, isRolling, triggerRoll)
+                    PlayerPanel(2, "Yellow", engine.state.currentPlayer == 2, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
                 }
             }
 
-            // Cinematic Zoom Animation
-            var cinematicScale by remember { mutableStateOf(1f) }
-            val animCinematicScale by animateFloatAsState(targetValue = cinematicScale, animationSpec = spring(dampingRatio = 0.5f, stiffness = 100f))
+            LaunchedEffect(engine.state.currentPlayer, engine.state.hasRolled, engine.state.tokens) {
+                if (engine.state.playerModes[engine.state.currentPlayer] == PlayerMode.HUMAN) {
+                    turnRemainingMs = 10000L
+                    while(turnRemainingMs > 0) {
+                        delay(100)
+                        turnRemainingMs -= 100
+                    }
+                    if (!engine.state.hasRolled) {
+                        triggerRoll(Offset.Zero, null)
+                    } else {
+                        val bestMove = engine.getBestMove()
+                        if (bestMove != null) {
+                            engine.moveToken(bestMove.id, bestMove.player) { action -> scope.launch { action() } }
+                        }
+                    }
+                }
+            }
             
             LaunchedEffect(engine.state.lastKillTimestamp) {
                 if (engine.state.lastKillTimestamp > 0) {
-                    cinematicScale = 1.45f
+                    cinematicScale = if (engine.state.isRevengeEvent) 1.65f else 1.45f
+                    if (engine.state.isRevengeEvent) {
+                        isRevengeBannerVisible = true
+                        launch {
+                            for(i in 0..15) {
+                                shakeOffsetX.snapTo(if (i % 2 == 0) 15f else -15f)
+                                shakeOffsetY.snapTo(if (i % 3 == 0) 10f else -10f)
+                                delay(30)
+                            }
+                            shakeOffsetX.snapTo(0f)
+                            shakeOffsetY.snapTo(0f)
+                        }
+                    }
                     delay(1500)
                     cinematicScale = 1f
+                    isRevengeBannerVisible = false
                 }
             }
 
@@ -562,6 +909,8 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     .graphicsLayer {
                         scaleX = animCinematicScale
                         scaleY = animCinematicScale
+                        translationX = shakeOffsetX.value
+                        translationY = shakeOffsetY.value
                         if (engine.state.lastKillPos >= 0 && engine.state.lastKillPos < globalPath.size) {
                              val cell = globalPath[engine.state.lastKillPos]
                              val pivotX = (cell.second + 0.5f) / 15f
@@ -656,6 +1005,31 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                     starPath.close()
                                     drawPath(starPath, Color.White.copy(alpha = 0.9f))
                                 }
+
+                                // Danger Zone Shading
+                                if (globalIdx != -1 && !safeCells.contains(globalIdx)) {
+                                    val tokensHere = engine.state.tokens.filter { it.steps in 0..50 && ((it.player * 13 + it.steps)%52 == globalIdx) }
+                                    if (tokensHere.isNotEmpty()) {
+                                        var inDanger = false
+                                        val herePlayer = tokensHere.first().player
+                                        for (pl in 0..3) {
+                                            if (pl == herePlayer) continue
+                                            val enemies = engine.state.tokens.filter { it.player == pl && it.steps in 0..50 }
+                                            for (e in enemies) {
+                                                val eGlobal = (e.player * 13 + e.steps) % 52
+                                                val dist = (globalIdx - eGlobal + 52) % 52
+                                                if (dist in 1..6) {
+                                                    inDanger = true
+                                                    break
+                                                }
+                                            }
+                                            if (inDanger) break
+                                        }
+                                        if (inDanger) {
+                                            drawRect(color = Color.Red.copy(alpha = 0.35f), topLeft = Offset(col * cxPx, row * cxPx), size = Size(cxPx, cxPx))
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -710,7 +1084,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                     val animY by animateDpAsState(targetValue = targetY, animationSpec = spring(dampingRatio = 0.6f, stiffness = 60f))
                     
                     
-                    val isMyTurnToken = engine.state.currentPlayer == token.player && engine.state.hasRolled && !isRolling && engine.isValidMove(token, currentDiceValue)
+                    val isMyTurnToken = engine.state.currentPlayer == token.player && engine.state.hasRolled && engine.isValidMove(token, currentDiceValue)
                     
                     val scale by animateFloatAsState(
                          targetValue = if (isMyTurnToken) activePulse else if (isOnPath && tokensAtPos.size > 1) 0.85f else 1f,
@@ -784,7 +1158,7 @@ fun LudoApp(modifier: Modifier = Modifier) {
                                 shape = CircleShape
                             }
                             .background(getPlayerColor(token.player), CircleShape)
-                            .border(1.dp, Color.Black.copy(alpha = 0.6f), CircleShape)
+                            .border(if (token.rivalPlayer != -1) 3.dp else 1.dp, if (token.rivalPlayer != -1) getPlayerColor(token.rivalPlayer) else Color.Black.copy(alpha = 0.6f), CircleShape)
                             .clickable { 
                                 engine.moveToken(token.id, token.player) { action -> scope.launch { action() } } 
                             }
@@ -843,10 +1217,10 @@ fun LudoApp(modifier: Modifier = Modifier) {
             // Bottom UI: Red and Blue
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(0, "Red", engine.state.currentPlayer == 0, currentDiceValue, isRolling, triggerRoll)
+                    PlayerPanel(0, "Red", engine.state.currentPlayer == 0, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
                 }
                 Box(modifier = Modifier.weight(1f)) {
-                    PlayerPanel(3, "Blue", engine.state.currentPlayer == 3, currentDiceValue, isRolling, triggerRoll)
+                    PlayerPanel(3, "Blue", engine.state.currentPlayer == 3, currentDiceValue, diceVisible, diceRollTrigger, turnRemainingMs, triggerRoll)
                 }
             }
             
@@ -902,64 +1276,142 @@ fun LudoApp(modifier: Modifier = Modifier) {
             }
         }
 
-        // Flying Dice Overlay
-        if (diceVisible) {
-            val commonModifier = Modifier
-                .align(Alignment.Center)
-                .offset(x = diceOffsetX.value.dp, y = diceOffsetY.value.dp)
-                .size(90.dp)
-                .graphicsLayer {
-                    scaleX = diceScale.value
-                    scaleY = diceScale.value
-                    rotationZ = diceRotationZ.value
-                    shadowElevation = if (isRolling) 32f else 16f
-                    shape = RoundedCornerShape(16.dp)
-                }
 
-            Box(modifier = commonModifier, contentAlignment = Alignment.Center) {
-                if (showGoldenPulse) {
-                    val infiniteTransition = rememberInfiniteTransition()
-                    val pulseScale by infiniteTransition.animateFloat(
-                        initialValue = 1f,
-                        targetValue = 1.3f,
-                        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse)
-                    )
-                    val pulseAlpha by infiniteTransition.animateFloat(
-                        initialValue = 1f,
-                        targetValue = 0f,
-                        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Restart)
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .scale(pulseScale)
-                            .border(4.dp, Color(0xFFFFD700).copy(alpha = pulseAlpha), RoundedCornerShape(16.dp))
-                    )
-                }
 
-                var visualValue by remember { mutableStateOf(diceValue) }
-                LaunchedEffect(isRolling) {
-                    if (isRolling) {
-                        while (isRolling) {
-                            visualValue = Random.nextInt(1, 7)
-                            delay(40)
-                        }
-                    } else {
-                        visualValue = diceValue
+        if (showVictoryScreen && winningPlayerIndex != -1) {
+            VictoryScreen(winnerIndex = winningPlayerIndex) {
+                showVictoryScreen = false
+            }
+        }
+        
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isRevengeBannerVisible,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { -it }),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { -it }),
+            modifier = Modifier.align(Alignment.TopCenter)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 40.dp)
+                    .background(Brush.horizontalGradient(listOf(Color.Transparent, Color(0xAA000000), Color.Transparent)))
+                    .padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "REVENGE!",
+                    style = MaterialTheme.typography.displayMedium,
+                    color = Color.Red,
+                    fontWeight = FontWeight.Black,
+                    letterSpacing = 4.sp,
+                    modifier = Modifier.graphicsLayer {
+                        shadowElevation = 16f
                     }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(diceColor, RoundedCornerShape(16.dp))
-                        .border(3.dp, Color.White, RoundedCornerShape(16.dp)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    DiceDots(if (isRolling) visualValue else diceValue)
-                }
+                )
             }
         }
     }
 }
 
+data class Particle(
+    var x: Float,
+    var y: Float,
+    var vx: Float,
+    var vy: Float,
+    var color: androidx.compose.ui.graphics.Color,
+    var rotation: Float,
+    var rotationSpeed: Float
+)
+
+fun getPlayerName(index: Int) = when(index) {
+    0 -> "Red"
+    1 -> "Green"
+    2 -> "Yellow"
+    3 -> "Blue"
+    else -> "Unknown"
+}
+
+@Composable
+fun VictoryScreen(winnerIndex: Int, onDismiss: () -> Unit) {
+    val winningPlayerName = getPlayerName(winnerIndex)
+    val color = getPlayerColor(winnerIndex)
+    
+    val scale = remember { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(Unit) {
+        scale.animateTo(1f, androidx.compose.animation.core.tween(1000, easing = androidx.compose.animation.core.FastOutSlowInEasing))
+    }
+    
+    val particles = remember {
+        List(150) {
+            Particle(
+                x = kotlin.random.Random.nextFloat(),
+                y = kotlin.random.Random.nextFloat() * -1f - 0.2f,
+                vx = (kotlin.random.Random.nextFloat() - 0.5f) * 0.3f,
+                vy = kotlin.random.Random.nextFloat() * 1.5f + 1f,
+                color = listOf(androidx.compose.ui.graphics.Color.Red, androidx.compose.ui.graphics.Color.Green, androidx.compose.ui.graphics.Color(0xFFFFD700), androidx.compose.ui.graphics.Color.Blue).random(),
+                rotation = kotlin.random.Random.nextFloat() * 360f,
+                rotationSpeed = (kotlin.random.Random.nextFloat() - 0.5f) * 15f
+            )
+        }.toMutableStateList()
+    }
+
+    val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition()
+    val frame by infiniteTransition.animateFloat(
+        initialValue = 0f, targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(androidx.compose.animation.core.tween(16, easing = androidx.compose.animation.core.LinearEasing))
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.7f))
+            .clickable { onDismiss() }
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val _ignore = frame
+            particles.forEach { p ->
+                p.x += p.vx * 0.016f
+                p.y += p.vy * 0.016f
+                p.rotation += p.rotationSpeed
+                if (p.y > 1.2f) {
+                    p.y = -0.2f
+                    p.x = kotlin.random.Random.nextFloat()
+                }
+                
+                withTransform({
+                    translate(p.x * size.width, p.y * size.height)
+                    rotate(p.rotation)
+                }) {
+                    drawRect(p.color, topLeft = Offset(-10f, -10f), size = androidx.compose.ui.geometry.Size(20f, 20f))
+                }
+            }
+        }
+        
+        Column(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .graphicsLayer {
+                    scaleX = scale.value
+                    scaleY = scale.value
+                }
+                .background(androidx.compose.ui.graphics.Color.White, RoundedCornerShape(24.dp))
+                .border(4.dp, color, RoundedCornerShape(24.dp))
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            androidx.compose.material3.Text(
+                text = "VICTORY!",
+                fontSize = 48.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Black,
+                color = color
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            androidx.compose.material3.Text(
+                text = "$winningPlayerName Wins",
+                fontSize = 24.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                color = androidx.compose.ui.graphics.Color.DarkGray
+            )
+        }
+    }
+}
